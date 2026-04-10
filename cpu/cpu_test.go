@@ -11,7 +11,7 @@ type FlatMemory struct {
 	Data [65536]uint8
 }
 
-func (m *FlatMemory) Read(addr uint16) uint8      { return m.Data[addr] }
+func (m *FlatMemory) Read(addr uint16) uint8       { return m.Data[addr] }
 func (m *FlatMemory) Write(addr uint16, val uint8) { m.Data[addr] = val }
 
 // ---------------------------------------------------------------------------
@@ -24,8 +24,8 @@ func setupCPU(program []byte, origin uint16) (*CPU, *FlatMemory) {
 	// Set reset vector to origin.
 	mem.Data[0xFFFC] = uint8(origin)
 	mem.Data[0xFFFD] = uint8(origin >> 8)
-	c := New(mem)
-	c.Reset()
+	c := NewCPU(mem)
+	c.Reset() // Set PC to reset vector (origin)
 	return c, mem
 }
 
@@ -142,7 +142,7 @@ func TestJSRAndRTS(t *testing.T) {
 	mem.Data[0x0500] = 0xA9 // LDA #$77
 	mem.Data[0x0501] = 0x77
 	mem.Data[0x0502] = 0x60 // RTS
-	runN(c, 3) // JSR, LDA, RTS
+	runN(c, 3)              // JSR, LDA, RTS
 	if c.A != 0x77 {
 		t.Fatalf("expected A=0x77, got 0x%02X", c.A)
 	}
@@ -390,7 +390,7 @@ func TestDormann(t *testing.T) {
 	mem := &FlatMemory{}
 	copy(mem.Data[:], data)
 
-	c := New(mem)
+	c := NewCPU(mem)
 	c.PC = dormannStart
 
 	prevPC := c.PC
@@ -434,7 +434,7 @@ func TestDormannTrace(t *testing.T) {
 	mem := &FlatMemory{}
 	copy(mem.Data[:], data)
 
-	c := New(mem)
+	c := NewCPU(mem)
 	c.PC = dormannStart
 
 	prevPC := c.PC

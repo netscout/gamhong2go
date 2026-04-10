@@ -3,13 +3,13 @@ package cpu
 // Status register flag bits.
 const (
 	FlagC uint8 = 1 << iota // Carry
-	FlagZ                    // Zero
-	FlagI                    // Interrupt disable
-	FlagD                    // Decimal mode
-	FlagB                    // Break command
-	FlagU                    // Unused (always 1)
-	FlagV                    // Overflow
-	FlagN                    // Negative
+	FlagZ                   // Zero
+	FlagI                   // Interrupt disable
+	FlagD                   // Decimal mode
+	FlagB                   // Break command
+	FlagU                   // Unused (always 1)
+	FlagV                   // Overflow
+	FlagN                   // Negative
 )
 
 // Addressing modes for the 6502 instruction set.
@@ -54,8 +54,8 @@ type CPU struct {
 	extraCycles int  // Extra cycles added by branches
 }
 
-// New returns a CPU wired to the given memory, in post-reset state.
-func New(mem Memory) *CPU {
+// NewCPU returns a CPU wired to the given memory, in post-reset state.
+func NewCPU(mem Memory) *CPU {
 	c := &CPU{
 		SP:  0xFD,
 		P:   FlagU | FlagI,
@@ -111,7 +111,7 @@ func (c *CPU) resolve(mode addrMode) uint16 {
 		return addr
 
 	case mZeroPageX:
-		addr := uint16(c.read(c.PC) + c.X) // wraps within zero page
+		addr := uint16(c.read(c.PC) + c.X) // wraps within zero page(convert to 16bit after adding 8bit + 8bit which causes overflow)
 		c.PC++
 		return addr
 
@@ -208,7 +208,7 @@ func (c *CPU) read16Wrap(addr uint16) uint16 {
 // ---------------------------------------------------------------------------
 
 func (c *CPU) push(val uint8) {
-	c.write(0x0100|uint16(c.SP), val)
+	c.write(0x0100|uint16(c.SP), val) // Stack pointer's high byte is always 0x01(hardwired), so SP only need low byte to calculate the address
 	c.SP--
 }
 
@@ -260,7 +260,8 @@ func (c *CPU) branch(mode addrMode, condition bool) {
 	target := c.resolve(mode)
 	if condition {
 		c.extraCycles++
-		if (c.PC & 0xFF00) != (target & 0xFF00) {
+		targetOnSamePage := (c.PC & 0xFF00) == (target & 0xFF00)
+		if !targetOnSamePage {
 			c.extraCycles++
 		}
 		c.PC = target
