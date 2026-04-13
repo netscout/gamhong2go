@@ -1,0 +1,592 @@
+# Educational Walkthrough: `io/softswitches.go` -- Reads With Side Effects
+
+> This document walks through every section of `io/softswitches.go` for a reader who has just finished the bus walkthrough. It introduces the single strangest idea in early microcomputer design -- memory addresses where merely READING is itself a command -- and then walks the code that implements the Apple II keyboard, video mode, speaker, and paddle softswitches. Each code section follows the familiar What It Is / Why It Matters / How the Code Works / Real-World Analogy pattern.
+
+---
+
+## Section 0: Background -- What Is a Softswitch?
+
+You already know, from Section 3 of the CPU walkthrough (The Memory Interface), that the 6502 has no special "talk to keyboard" or "set video mode" instructions. Every peripheral looks like memory. Writing to a particular address is how you output data; reading from a particular address is how you receive it. That is memory-mapped I/O, and you have seen it described in concept since the first walkthrough.
+
+Now we reach the part that surprises everyone the first time they encounter it.
+
+**On the Apple II, reading an address can change hardware state.** Not "reading returns a value that you then act on." The act of placing an address on the bus and completing the read cycle -- regardless of what byte value comes back -- is itself sufficient to flip a hardware latch. No data transfer is required. The signal is the access.
+
+Here is the hardware mechanism in plain terms. The Apple II motherboard contains a set of flip-flops -- simple two-state latches, essentially one-bit registers in silicon. Each flip-flop's chip-select line is wired to the upper address bits so it activates whenever the address bus lands on a specific range. Address bit 0 (A0) is wired to the flip-flop's set/reset input. When the address is even (A0 = 0), the flip-flop resets to 0. When the address is odd (A0 = 1), the flip-flop sets to 1. The data bus is completely uninvolved. The CPU can be performing a read or a write; the flip-flop does not look at the R/W line. It only sees chip-select and A0.
+
+These are called **softswitches** because they are toggled by software access rather than by a physical DIP switch or jumper on the board. "Soft" as opposed to "hard" -- the state can be changed in a running program by a simple memory access.
+
+The contrast with ordinary memory is stark:
+
+```text
+     Normal memory read                Softswitch read
+     ------------------                ----------------
+
+   CPU --addr=$1234--> RAM        CPU --addr=$C050--> flip-flop
+   CPU <--byte=$42---  RAM        CPU <--byte=$00---  flip-flop
+                                               |
+                                               v
+                                      state toggled:
+                                      TextMode: true  -> false
+                                      (no data actually transferred;
+                                       addressing the chip IS the signal)
+```
+
+The byte `$00` returned by the softswitch read is just a formality -- it has to put something on the data lines. The meaningful event was the address arriving at the chip-select logic.
+
+The I/O softswitches live in a 256-byte region of the Apple II memory map:
+
+```text
+  $0000 +---------------------+  0
+        |                     |
+        |        RAM          |
+        |   (user + screen)   |
+        |                     |
+  $C000 +---------------------+  49152
+        |    I/O softswitches |  <-- this walkthrough
+  $C100 +---------------------+  49408
+        |   slot ROM / empty  |
+  $D000 +---------------------+  53248
+        |                     |
+        |        ROM          |
+        |     (firmware)      |
+        |                     |
+  $FFFF +---------------------+  65535
+```
+
+`$C000`-`$C0FF` (49,152-49,407 decimal) is the 256-byte I/O window. This is the memory map region described in Section 4 of the memory walkthrough (Putting It Together), and it is also the region shown in Section 2.5 of the CPU walkthrough (The 6502 Memory Map). The I/O region is why the bus overlay stacks in the order RAM first, I/O second, ROM third -- it sits between RAM and ROM and shadows a 256-byte hole in the user RAM.
+
+The real Apple II had seven broad categories of softswitches: keyboard, speaker, cassette tape, video mode, paddle/annunciator, slot I/O expansion, and language card. Our emulator implements a purposeful subset: keyboard (`$C000`/`$C010`), video mode flags (`$C050`-`$C057`), speaker (`$C030`, stubbed), and paddle/push buttons (`$C061`-`$C067`, stubbed). Bank switching and the language card are outside the scope of this walkthrough -- a future iteration will add those.
+
+The mental model that carries through this whole walkthrough is: **the address is the command, and the byte on the data lines is incidental.** Keep that phrase in mind.
+
+Bus routing from the previous walkthrough (Section 8, Putting It Together) is what delivers these reads to the `SoftSwitches` object in the first place. We will see that end-to-end in Section 6.
+
+---
+
+## Section 1: The `SoftSwitches` Struct
+
+### What It Is
+
+```go
+// SoftSwitches handles the Apple II I/O space at $C000-$C0FF.
+// For now this is a minimal stub that returns sensible defaults
+// so the ROM boot code doesn't hang. Keyboard input and graphics
+// mode switching will be filled in during later iterations.
+type SoftSwitches struct {
+    // Keyboard
+    KeyData  uint8 // last key pressed (bit 7 = strobe)
+    KeyReady bool  // true when a new key is available
+
+    // Graphics mode flags (soft switch state)
+    TextMode    bool // true = text, false = graphics
+    MixedMode   bool // true = mixed (4 lines of text at bottom)
+    Page2       bool // true = display page 2
+    HiRes       bool // true = hi-res, false = lo-res
+}
+```
+
+Six fields, grouped into keyboard state and graphics state.
+
+### Why It Matters
+
+Compare the three device types you have met so far. RAM stores **user bytes** -- the running program's variables, stack, screen buffers. ROM stores **firmware bytes** -- the instruction stream the CPU executes at startup. `SoftSwitches` stores neither. It stores **hardware mode flags** -- the current electrical state of display and input circuits on the motherboard.
+
+This is not a memory region in any meaningful sense. It is a tiny **state machine**. The six fields together answer the question: what does the Apple II's hardware look like right now?
+
+### How the Code Works
+
+`KeyData uint8` -- holds the ASCII code of the most recent keypress. Critically, bit 7 is NOT stored here. Bit 7 is the "strobe" -- the signal that says "there is an unread key waiting." It is computed on demand at read time from the `KeyReady` flag. Storing the strobe bit inside `KeyData` would mean two places tracking the same truth, and they could drift out of sync.
+
+`KeyReady bool` -- a Go boolean standing in for the real keyboard latch's strobe bit. `true` means a key has been pressed and not yet read by the CPU; `false` means the keyboard is idle or the last key has already been consumed.
+
+`TextMode bool` -- when `true`, the display subsystem shows 40 columns of 24 rows of ASCII characters. When `false`, the display is in graphics mode. This is the most commonly toggled switch in typical Apple II software.
+
+`MixedMode bool` -- only meaningful when `TextMode` is `false` (we are already in graphics mode). When `true`, the top 20 lines of the screen are graphics and the bottom 4 lines remain text. This is the "mixed" display popular in games: a graphics playfield with a text score line underneath.
+
+`Page2 bool` -- the Apple II has two display pages. Page 1 lives at `$0400` (1,024) for text or `$2000` (8,192) for hi-res graphics. Page 2 lives at `$0800` (2,048) or `$4000` (16,384). When `Page2` is `false`, the display hardware reads from page 1; when `true`, it reads from page 2. This enables double-buffering: draw a frame off-screen to page 2, then flip `Page2` to make it visible instantly.
+
+`HiRes bool` -- when `false` and `TextMode` is `false`, the display is in lo-res graphics mode: a 40-column by 48-row grid of large color blocks. When `true`, the display is in hi-res mode: 280 pixels wide by 192 pixels tall. `TextMode` must be `false` for `HiRes` to have any effect on the rendered image.
+
+### Real-World Analogy
+
+Think of a car dashboard. Headlights are on or off. Wipers are fast or slow. The heater is on or off. None of those switches store your driving data. They describe the **current operating mode** of the vehicle's hardware. `SoftSwitches` is that dashboard: six bits describing how the Apple II's hardware is configured right now.
+
+---
+
+## Section 2: `NewSoftSwitches()` -- The Default Boot State
+
+### What It Is
+
+```go
+// NewSoftSwitches returns I/O in the default boot state (text mode).
+func NewSoftSwitches() *SoftSwitches {
+    return &SoftSwitches{
+        TextMode: true,
+    }
+}
+```
+
+One field set explicitly. Everything else takes Go's zero value.
+
+### Why It Matters
+
+The Apple II boots into text mode. The Monitor prompt (`]`) is a text display. Applesoft BASIC runs in text mode by default. Every other flag being false on startup matches the real hardware's power-on state: no key waiting, no mixed mode, display page 1, lo-res.
+
+If `TextMode` defaulted to `false` (graphics) the way Go's zero-value booleans do, the ROM's boot sequence would be rendering to a blank graphics screen rather than the text terminal the firmware expects. One wrong default and nothing works.
+
+### How the Code Works
+
+In Go, a composite literal `&SoftSwitches{ TextMode: true }` leaves unmentioned fields at their zero values: `false` for `bool`, `0` for `uint8`. That means `KeyData`, `KeyReady`, `MixedMode`, `Page2`, and `HiRes` are all zero without any explicit assignment.
+
+`TextMode` is the only field whose sensible default (`true`) differs from Go's zero value (`false`), so it is the only field in the literal.
+
+The constructor returns a pointer (`*SoftSwitches`), consistent with `bus.New()` and `memory.NewRAM()` from the previous walkthroughs. Pointer receivers mean all methods operate on the same struct, so state mutations persist across calls.
+
+### Real-World Analogy
+
+A car rolling off the factory floor. The headlights are off, the wipers are off, the radio is off -- but the instrument cluster is already in "normal driving display" mode (the equivalent of `TextMode: true`). Default configurations are chosen to match what the machine will do first, not what Go's type system happens to produce.
+
+---
+
+## Section 3: `Read()` -- The Heart of Softswitch Behavior
+
+This is where the side-effect-on-read idea becomes concrete Go code. Each `case` in the `switch` statement is a small state transition on the `SoftSwitches` struct that happens **just because the CPU put an address on the bus**. Let's read the whole function first, then go sub-section by sub-section.
+
+```go
+// Read handles soft switch reads. Many switches are "read-triggered" --
+// simply reading the address changes hardware state.
+func (s *SoftSwitches) Read(addr uint16) uint8 {
+    switch addr {
+    // Keyboard
+    case 0xC000:
+        val := s.KeyData
+        if s.KeyReady {
+            val |= 0x80
+        }
+        return val
+    case 0xC010:
+        // Clear keyboard strobe
+        s.KeyReady = false
+        return s.KeyData & 0x7F
+
+    // Text/Graphics mode switches (accent on read)
+    case 0xC050:
+        s.TextMode = false
+        return 0
+    case 0xC051:
+        s.TextMode = true
+        return 0
+    case 0xC052:
+        s.MixedMode = false
+        return 0
+    case 0xC053:
+        s.MixedMode = true
+        return 0
+    case 0xC054:
+        s.Page2 = false
+        return 0
+    case 0xC055:
+        s.Page2 = true
+        return 0
+    case 0xC056:
+        s.HiRes = false
+        return 0
+    case 0xC057:
+        s.HiRes = true
+        return 0
+
+    // Speaker toggle (stub -- no audio yet)
+    case 0xC030:
+        return 0
+
+    // Annunciator and paddle stubs
+    case 0xC061, 0xC062, 0xC063: // push buttons
+        return 0 // not pressed
+    case 0xC064, 0xC065, 0xC066, 0xC067: // paddle timers
+        return 0 // expired
+    }
+
+    return 0x00
+}
+```
+
+### 3a. The Switch Statement Structure
+
+The body is a single `switch addr { ... }` comparing `addr` against raw hex constants. Several design points are worth noting.
+
+**Why a switch and not a map?** Go compiles `switch` statements with integer cases into efficient jump tables. The cases are known at compile time, there is no allocation, and the dispatch is a single branch instruction. A `map[uint16]func() uint8` would need allocation, an interface call, and a hash lookup on every bus cycle. The CPU runs at simulated MHz; the address decoder runs millions of times per second. A switch is the right tool.
+
+**Each case returns immediately.** There is no fallthrough. The function exits as soon as it finds a matching address. This makes it easy to read each case in isolation without worrying about interactions.
+
+**The final `return 0x00` outside the switch** is the "implemented-but-unhandled" fallback. It fires when the bus delivers an address in `$C000`-`$C0FF` that no explicit case covers. We will examine this in detail in Section 3f.
+
+### 3b. Keyboard: `$C000` (49,152) and `$C010` (49,168)
+
+```go
+case 0xC000:
+    val := s.KeyData
+    if s.KeyReady {
+        val |= 0x80
+    }
+    return val
+case 0xC010:
+    // Clear keyboard strobe
+    s.KeyReady = false
+    return s.KeyData & 0x7F
+```
+
+The Apple II keyboard interface is a two-address dance. `$C000` (49,152) delivers the key data, and `$C010` (49,168) clears the "new key waiting" signal.
+
+**The `$C000` branch** starts by copying `s.KeyData` into a local variable `val`. Then, if `s.KeyReady` is `true`, it ORs in `0x80` (`10000000` in binary). The result is a byte whose upper bit (bit 7) indicates whether a new key is waiting, and whose lower 7 bits carry the ASCII value of the key. The OR operation (`|= 0x80`) sets bit 7 without disturbing any of the lower 7 bits.
+
+Why is the strobe not stored directly in `KeyData`? Because `KeyReady` is the semantic truth. Bit 7 is just its projection into the returned byte, computed on demand. If we stored the strobe in `KeyData` too, two places would track the same fact, and a caller updating one but not the other would produce a silent bug.
+
+**The `$C010` branch** is the side-effect case. `s.KeyReady = false` clears the strobe latch. **This is a state mutation triggered purely by reading.** The CPU issued a read to `$C010`; as a direct result, the keyboard latch has been cleared. The returned value is `s.KeyData & 0x7F` -- bit 7 masked off (`$7F` = `01111111`), returning only the raw ASCII. Since the strobe has just been cleared, returning the unstrobed byte is internally consistent.
+
+The keyboard data byte format looks like this:
+
+```text
+  bit   7     6  5  4  3  2  1  0
+       +---+---+---+---+---+---+---+---+
+       | S |  ASCII value (0-127)      |
+       +---+---+---+---+---+---+---+---+
+         |
+         +-- strobe:
+             1 = new key waiting
+             0 = already read
+
+  Example: pressing 'A' (ASCII 65 = $41 = 01000001)
+    KeyReady=true  ->  $C000 returns  1 1000001  =  $C1 (193)
+    KeyReady=false ->  $C000 returns  0 1000001  =  $41 (65)
+```
+
+The ROM boot code uses this pair in a polling loop:
+
+```text
+  wait_for_key:
+      LDA $C000       ; read data + strobe
+      BPL wait_for_key ; bit 7 clear? loop
+      STA $C010       ; clear strobe (value stored is ignored)
+      ; A now holds the key with bit 7 set
+```
+
+Notice: the ROM does not call a keyboard function. It reads memory, tests the sign bit, loops. That is the entire keyboard API on a 1977 Apple II. The reason a single `BPL` instruction can test the strobe is explained in the CPU walkthrough's flag-helpers section (Status Register Flags and flag helper methods) -- the N flag is automatically set to bit 7 of whatever value is loaded into A. `LDA $C000` followed by `BPL wait_for_key` is a two-instruction "wait until bit 7 is set" loop.
+
+### 3c. Graphics Mode Switches: `$C050` (49,232) -- `$C057` (49,239)
+
+Eight cases, four pairs. Each pair controls one boolean flag: even address resets it, odd address sets it.
+
+```text
+  Address   Decimal   Effect                 Field changed
+  -------   -------   --------------------   -----------------
+  $C050     49232     graphics mode          TextMode = false
+  $C051     49233     text mode              TextMode = true
+  $C052     49234     full screen            MixedMode = false
+  $C053     49235     mixed (split) screen   MixedMode = true
+  $C054     49236     display page 1         Page2 = false
+  $C055     49237     display page 2         Page2 = true
+  $C056     49238     lo-res                 HiRes = false
+  $C057     49239     hi-res                 HiRes = true
+```
+
+All eight cases `return 0`. The byte value is meaningless -- the flip-flop on real hardware does not drive the data lines for these switches. Our emulator must return something (`uint8` has no "don't care" value), and `0` is the most benign choice. No Apple II program should be making decisions based on the return value of a graphics mode switch access.
+
+The hardware trick behind the even/odd pairing is elegant:
+
+```text
+  $C050  (49232)   even -> A0 = 0 -> RESET (TextMode = false, graphics)
+  $C051  (49233)   odd  -> A0 = 1 -> SET   (TextMode = true,  text)
+
+           +-------+           +-------+
+  A0=0 --->| RESET |   flip-   |       |
+           |       |   flop    | state |
+  A0=1 --->|  SET  |           |       |
+           +-------+           +-------+
+
+  Same hardware trick for:
+    $C052/$C053  MixedMode  off/on
+    $C054/$C055  Page2      off/on
+    $C056/$C057  HiRes      off/on
+```
+
+Address bit 0 (A0) is wired directly to the flip-flop's set/reset input. Even address means A0 = 0 means reset. Odd address means A0 = 1 means set. One wire, no extra decoding gates. The Apple II designers got four independent flags controlled by eight addresses for the cost of two select bits (`A1`, `A2`, which pick *which* flag) plus one direction bit (`A0`, which sets or resets it).
+
+From Applesoft BASIC you can trigger these directly: `POKE 49234,0` is the same as executing `STA $C052` in assembly -- it turns off mixed mode. The `0` byte passed to `POKE` is completely ignored; the address alone does the work. This is a perfect preview of Section 4, where we see that `Write` simply calls `Read`.
+
+### 3d. Speaker: `$C030` (49,200)
+
+```go
+// Speaker toggle (stub -- no audio yet)
+case 0xC030:
+    return 0
+```
+
+One case, two lines. Currently a stub -- it returns `0` with no side effect.
+
+The real hardware behavior is worth understanding anyway, because it is one of the most creative bits of hardware design in the Apple II. Reading `$C030` (49,200) toggles the speaker output membrane. Each read flips the voltage from low to high or vice versa. A single access produces one click.
+
+To generate a tone, ROM or BASIC code runs a tight loop:
+
+```text
+  ; produce approximately 440 Hz (concert A)
+  tone_loop:
+      LDA $C030    ; toggle speaker (access = click)
+      JSR delay    ; wait ~1.1 ms
+      JMP tone_loop
+```
+
+Frequency equals `1 / (2 * time_between_reads)`. If you access `$C030` every 1.136 milliseconds, you get 440 Hz. Change the delay and you change the pitch. The entire Apple II sound system in 1977 was this one flip-flop.
+
+Our implementation is a stub today. In a future walkthrough, the stub body would call into an audio backend that buffers toggle timestamps for resampling into an audio stream. This is also the exact address the bus walkthrough teased at its end -- "reading `$C030` produces a click on the Apple II speaker." We now see the code that will someday do that.
+
+### 3e. Paddles and Push Buttons: `$C061` (49,249) -- `$C067` (49,255)
+
+```go
+case 0xC061, 0xC062, 0xC063: // push buttons
+    return 0 // not pressed
+case 0xC064, 0xC065, 0xC066, 0xC067: // paddle timers
+    return 0 // expired
+```
+
+Two multi-case lines cover seven addresses.
+
+`$C061` / `$C062` / `$C063` (49,249 / 49,250 / 49,251) are the push buttons on game controllers (button 0, 1, and 2). On real hardware, bit 7 is `1` when the button is held down, `0` when released. Our stub returns `$00`, so bit 7 is zero -- from the perspective of any polling code, no button is ever pressed.
+
+`$C064` / `$C065` / `$C066` / `$C067` (49,252-49,255) are the paddle timer inputs for paddles 0-3. Bit 7 is `1` while the paddle's capacitor is still charging, then goes `0` when it has finished. Our stub returns `0` -- "already expired" -- meaning any code that reads these will interpret the paddle position as zero (all the way counterclockwise).
+
+For flavor: the paddle was not a digital input. The Apple II game controller used a potentiometer (a variable resistor -- the knob) to charge a capacitor at a rate proportional to the knob's position. Reading `$C070` (the paddle trigger, not implemented here) began a charging cycle. The ROM's `PREAD` routine then polled `$C064` in a tight loop and counted iterations until bit 7 went low.
+
+```text
+  Real Apple II paddle circuit (1977):
+
+    +5V ---/\/\/---+-----+-----> to $C064 input (comparator)
+          variable |     |
+          resistor |    === capacitor
+          (knob)   |     |
+                   +-----+-----> GND on trigger
+
+  Program writes $C070 -> capacitor begins charging
+  Program polls $C064 in a tight loop -> bit 7 goes 0 once charged
+  Number of loop iterations = knob position (0..255)
+```
+
+The iteration count became the paddle reading. Analog input on a digital computer in 1977, with nothing but a capacitor, a resistor, and a comparator.
+
+### 3f. The Default Fallback -- `return 0x00`
+
+```go
+    }
+
+    return 0x00
+}
+```
+
+The last line of `Read`, after the closing brace of the `switch`, is `return 0x00`. This fires when `addr` is somewhere in `$C000`-`$C0FF` (49,152-49,407) but does not match any explicit case.
+
+This is subtly different from the open-bus `$FF` fallback you saw in the bus walkthrough's Read function (discussed in Section 5 of the bus walkthrough and revisited in its Section 9 Q&A).
+
+The distinction matters:
+
+- The **bus** returns `$FF` for addresses where **no device is mapped at all**. This mimics pull-up resistors on an undriven data bus -- the "nobody's home" value.
+- The **softswitch device** returns `$00` for addresses where the device **is** mapped but the specific switch has not been implemented yet.
+
+Once the I/O device is registered with `bus.Map($C000, $C0FF, io)`, the `SoftSwitches` object is responsible for every address in that 256-byte window. If an Apple II program accesses, say, `$C080` (49,280) -- the language card control register, not yet implemented -- the bus correctly routes the read to `SoftSwitches.Read`, and `Read` returns `$00` from the fallback.
+
+Returning `$00` is less likely to mislead programs than `$FF` would be. `$FF` is a common "magic" value in 6502 code (the opcode for the unofficial `ISB` instruction, the reset-vector area, the initial stack fill value on some systems). `$00` is a bland "nothing interesting here," which is a safer placeholder for unimplemented-but-mapped switches.
+
+One honesty note for the curious: on real Apple II hardware, reading an undecoded address inside `$C000`-`$C0FF` does not return a clean `$00`. It returns whatever happened to be on the data bus on the previous cycle (bus noise, often the byte from the most recent video-fetch DMA). Some Apple II software famously abused this to detect hardware variants. Our emulator's deterministic `$00` is a deliberate simplification that trades hardware faithfulness for reproducibility, in the same spirit as the bus walkthrough's `$FF` open-bus discussion.
+
+---
+
+## Section 4: `Write()` -- Delegating to Read
+
+### What It Is
+
+```go
+// Write handles soft switch writes. Most switches respond to both
+// reads and writes at the same addresses.
+func (s *SoftSwitches) Write(addr uint16, val uint8) {
+    // The same switch addresses respond to writes too.
+    s.Read(addr)
+}
+```
+
+Three lines including the signature. The parameter `val` is accepted but never used.
+
+### Why It Matters
+
+On real hardware, the softswitch flip-flops respond to their chip-select signal. That signal fires on **any bus cycle** -- read or write. The flip-flop hardware does not look at the R/W line; it only sees "was my address on the bus?" Therefore, `STA $C050` (a pure write: the CPU stores the accumulator to address `$C050`) has exactly the same effect as `LDA $C050` (a pure read). Both assert chip-select on the `$C050` flip-flop. Both set `TextMode = false`.
+
+The emulator reproduces this by making `Write` call `Read`. It is not a hack or a shortcut; it is an accurate model of how the hardware works.
+
+### How the Code Works
+
+`val` is silently ignored. The softswitch does not care what byte you tried to write. The address alone carries the command.
+
+`s.Read(addr)` replays the switch case. Every state mutation that would happen on a read also happens on a write. The keyboard strobe clears if you write to `$C010`. Graphics mode switches if you write to `$C050`.
+
+A subtle edge case worth noting: `INC $C050` is a read-modify-write instruction. From our emulator's point of view it performs two softswitch accesses -- one read and one write -- both aimed at `$C050`. The read fires `Read($C050)` setting `TextMode = false`, and the write fires `Write($C050, ...)` which calls `Read($C050)` again, setting `TextMode = false` a second time. Two identical toggles leave the flag at `false`. On real hardware the same two chip-selects would fire, so the behavior matches. (The real 6502 actually issues more bus cycles per `INC abs` than that, including a quirky "dummy write" of the original value before the modified write, but the softswitch effect is the same: the address appears on the bus more than once.)
+
+### Real-World Analogy
+
+A pressure-sensitive doorbell. When you press the button, the bell rings. It does not matter whether you press it gently or firmly, whether you use one finger or your whole fist. The only thing that matters is that physical contact was made -- the mechanism activated. You cannot "press the doorbell with data." The softswitch is the same: the only thing that matters is that the address appeared on the bus.
+
+---
+
+## Section 5: `PressKey()` -- The Emulator's Input Entry Point
+
+### What It Is
+
+```go
+// PressKey simulates a keypress. Sets the key data and strobe.
+func (s *SoftSwitches) PressKey(key uint8) {
+    s.KeyData = key & 0x7F // store raw key; Read() adds strobe from KeyReady
+    s.KeyReady = true
+}
+```
+
+Three lines. This is the bridge between the host operating system and the emulated Apple II keyboard latch.
+
+### Why It Matters
+
+Without `PressKey`, there is no way for the outside world to get a keystroke into the emulated machine. The host process (a terminal program, a GUI, an SDL window) reads a key from the keyboard, then calls `io.PressKey(key)`. After that, the emulated 6502 sees a new key available the next time it reads `$C000`.
+
+This function defines the **boundary** between host and guest. Everything above it -- detecting that the user pressed a key, deciding which ASCII code to send -- is host code. Everything below it -- the 6502 ROM polling `$C000`, testing bit 7, clearing the strobe -- is emulated code. `PressKey` is the doorway between them.
+
+### How the Code Works
+
+`s.KeyData = key & 0x7F` stores the key with bit 7 forcibly cleared. The mask (`$7F` = `01111111`) ensures that even if the caller passed a byte with bit 7 set (perhaps for some extended key code), only the 7-bit ASCII value goes into storage. Bit 7 will be restored dynamically by `Read($C000)` based on `KeyReady`, not by storing it here.
+
+`s.KeyReady = true` sets the strobe flag. The next time the emulated ROM reads `$C000`, it will receive bit 7 set, and the `BPL wait_for_key` loop will fall through.
+
+There is **no key buffer beyond one byte**. If the user types two keys in rapid succession before the emulated CPU polls `$C000`, the second keypress overwrites the first. This mirrors real Apple II hardware -- the keyboard latch is one byte, not a FIFO. Software that needs to avoid missed keys must poll frequently.
+
+There is also no way for `PressKey` to "un-press" a key. Only the emulated CPU's read of `$C010` clears the strobe. Once you call `PressKey`, the key stays ready until the ROM reads it.
+
+### Real-World Analogy
+
+A mailbox. The mail carrier (host OS) places a letter (keypress) in the box and raises the flag (`KeyReady = true`). The resident (ROM polling code) checks the flag, retrieves the letter (reads `$C000`), and lowers the flag by collecting it (reads `$C010`). The mailbox holds exactly one letter. A second delivery before pickup silently replaces the first.
+
+---
+
+## Section 6: Putting It Together -- A Complete Trace
+
+Let's follow a realistic scenario end-to-end: the emulator has booted, the user types 'A' in the emulator window, and the ROM code then decides to switch to graphics mode.
+
+```text
+  Step | Actor        | Action                       | State after
+  -----+--------------+------------------------------+--------------------------
+   1   | main.go      | bus.Map($C000,$C0FF, io)     | mappings: [RAM, I/O, ROM]
+   2   | host OS      | io.PressKey('A')             | KeyData=$41, KeyReady=true
+   3   | 6502 ROM     | LDA $C000                    | A = $C1  (strobe + 'A')
+   4   | 6502 ROM     | BPL wait_for_key  (not taken)| -
+   5   | 6502 ROM     | STA $C010  (clear strobe)    | KeyReady=false
+   6   | 6502 ROM     | BIT $C050                    | TextMode=false (graphics)
+   7   | video (future)| reads TextMode              | renders graphics frame
+
+  Underneath each CPU access:
+     CPU.Read($C000) -> bus.Read($C000) -> io.Read($C000) -> $C1
+     CPU.Write($C010,A) -> bus.Write($C010,A) -> io.Write($C010,A) -> io.Read($C010)
+     CPU.Read($C050) -> bus.Read($C050) -> io.Read($C050) -> 0
+```
+
+**Step 1** is setup. `main.go` calls `bus.Map` to register the `SoftSwitches` object as the device for the range `$C000`-`$C0FF` (49,152-49,407). From this point on, any CPU read or write in that range lands in `SoftSwitches.Read` or `SoftSwitches.Write`.
+
+**Step 2** is the host boundary. The terminal detected that the user pressed 'A'. It calls `io.PressKey('A')` (where `'A'` is ASCII 65 = `$41`). `KeyData` is now `$41`, `KeyReady` is `true`. The emulated CPU has not done anything yet.
+
+**Step 3**: the 6502 ROM executes `LDA $C000`. The CPU fetches the instruction, decodes it, and issues a memory read at `$C000`. The bus walks its mapping slice backward, finds the I/O mapping covering `$C000`-`$C0FF`, and calls `io.Read($C000)`. Inside `Read`, the `$C000` case runs: `val = $41`, then because `KeyReady` is `true`, `val |= 0x80` gives `$C1` (193 decimal). The CPU loads `$C1` into register A.
+
+**Step 4**: the ROM executes `BPL wait_for_key`. `LDA` set the N flag to bit 7 of `$C1`, which is `1`. A set N flag means the result was "negative" (the signed interpretation). `BPL` branches if N is clear. N is set, so the branch is **not taken** -- the loop exits. The CPU has detected a waiting key.
+
+**Step 5**: the ROM executes `STA $C010` to clear the strobe. `STA` issues a write. The bus routes the write to `SoftSwitches.Write($C010, $C1)`. `Write` calls `Read($C010)`, which sets `s.KeyReady = false`. The strobe is now cleared. The keyboard latch is free to receive the next keypress.
+
+**Step 6**: the ROM executes `BIT $C050` to switch to graphics mode. `BIT` performs a read of the operand address. The bus routes the read to `io.Read($C050)`. The `$C050` case sets `s.TextMode = false`. Graphics mode is now active. The return value `0` is used by `BIT` to update the N, V, and Z flags (N and V from bits 7 and 6 of the fetched byte, Z from `A AND 0`), but those flag updates are irrelevant to a mode-switch code path -- the important thing was the address, not the byte.
+
+**Step 7** is future work: the video renderer (not yet in this codebase) will consult `TextMode` and `HiRes` on every frame to decide how to draw the screen.
+
+Here is how the bus delivered steps 3 through 6:
+
+```text
+  CPU.Read($C000)
+     |
+     v
+  bus.Read($C000)   [walks mappings backward]
+     |  finds index 1 (I/O, $C000-$C0FF)
+     v
+  io.Read($C000)    [switch case 0xC000]
+     |
+     v
+  returns $C1
+```
+
+We are finally exercising the bus routing the last walkthrough taught, with a device whose `Read` method does something more interesting than "index into a slice." Cross-reference Section 8 of the bus walkthrough (Putting It Together) for the detailed mechanics of how the backward walk selects the I/O device over any earlier-mapped device covering the same range.
+
+---
+
+## Section 7: Design Decisions and Hardware Reality
+
+#### Why does reading an address change hardware state?
+
+The chip-select signal on a real 6502 bus cycle fires for both reads and writes. The flip-flop only sees chip-select; it does not observe the R/W line. In software terms, the side effect happens on access, not on data transfer. This was a deliberate hardware design choice in 1977 -- it let Steve Wozniak control eight display parameters using eight addresses, with no separate "command" infrastructure at all. The address bus carried the command for free.
+
+#### Why are switches paired at even/odd addresses?
+
+Address bit 0 (A0) is wired directly to the set/reset input of the flip-flop. Even (A0 = 0) resets the latch; odd (A0 = 1) sets it. One wire, no extra decoding gates. The hardware designers got eight switches for the cost of two select bits above A0 (A1 and A2 pick which flag) plus the A0 direction bit. It is the kind of elegant circuit minimalism that the 1977 parts budget required.
+
+#### Why does `Write` call `Read` instead of duplicating the logic?
+
+On real hardware, reads and writes at these addresses are indistinguishable to the flip-flops. Delegating in software reproduces that indistinguishability by construction. Duplicating the `switch` statement would mean two copies of every case, and they would eventually drift -- someone adds a case to `Read` and forgets to add it to `Write`. Delegation makes the code correct by structure rather than by discipline.
+
+#### Why is the default return `$00` instead of `$FF`?
+
+The bus returns `$FF` for **unmapped** addresses (open bus, the "nobody's home" value from pull-up resistors -- see the bus walkthrough's open-bus discussion in Section 5). Once the I/O device is mapped, it owns the whole `$C000`-`$C0FF` window. Returning `$00` for **unimplemented but mapped** addresses distinguishes "I do not know about this switch yet" from "no device at all." A program that reads an unimplemented register and gets `$00` is in a predictable state; getting `$FF` might accidentally look like a valid data byte on some registers.
+
+#### Why is the keyboard strobe in bit 7 specifically?
+
+So that a single `BPL` (branch-if-plus, N flag clear) instruction can test it. The 6502's `LDA` instruction automatically sets the N flag to bit 7 of the loaded value. Wiring the strobe to bit 7 makes "wait for a key" a two-instruction loop: `LDA $C000` then `BPL back`. If the strobe were in, say, bit 3, the loop would require a `BIT` instruction or an `AND #$08` plus a `BEQ` -- more bytes, more cycles, and more complexity in every keyboard-reading loop in every program ever written for the Apple II. The CPU walkthrough's section on Status Register Flags and the N flag explains why bit 7 is the natural flag position for this kind of single-bit test.
+
+#### Why is this described as a "minimal stub"?
+
+The comment at the top of the file says "For now this is a minimal stub." The real Apple II has many more softswitches: cassette tape in/out, annunciator outputs (general-purpose output lines the user could wire to anything), slot I/O expansion ROM selection, 80-column card registers, and the language card bank-switching registers. This file implements just enough to let the ROM boot without hanging, support keyboard polling, and allow video mode switching. More switches can be added by appending cases to the `switch` statement. The bus wiring does not change -- the I/O device is already mapped; it just needs more cases inside its `Read` method.
+
+---
+
+## Section 8: Summary and What's Next
+
+Softswitches are devices whose `Read` and `Write` methods have side effects beyond storing or returning data. Addressing the chip is itself the command; the byte traveling over the data lines is incidental. Our implementation covers the Apple II keyboard (`$C000`/`$C010`), video mode flags (`$C050`-`$C057`), the speaker (`$C030`, stubbed), and paddle/push buttons (`$C061`-`$C067`, stubbed). All of them share one 94-line file and plug into the bus with a single `Map($C000, $C0FF, io)` call.
+
+> **Take-home idea:** Memory-mapped I/O says "hardware and memory look the same to the CPU." Softswitches take that one step further -- **the address itself is the command**, and the byte on the data lines is only along for the ride.
+
+### Table A: Implemented Switches
+
+| Address         | Decimal          | Category | Effect                                     |
+|-----------------|------------------|----------|--------------------------------------------|
+| $C000           | 49,152           | Keyboard | Read data + strobe (bit 7)                 |
+| $C010           | 49,168           | Keyboard | Clear strobe                               |
+| $C030           | 49,200           | Speaker  | Toggle speaker output (stub -- no audio)   |
+| $C050 / $C051   | 49,232 / 49,233  | Video    | TextMode off / on                          |
+| $C052 / $C053   | 49,234 / 49,235  | Video    | MixedMode off / on                         |
+| $C054 / $C055   | 49,236 / 49,237  | Video    | Page2 off / on                             |
+| $C056 / $C057   | 49,238 / 49,239  | Video    | HiRes off / on                             |
+| $C061-$C063     | 49,249-49,251    | Input    | Push buttons 0-2 (stub -- always 0)        |
+| $C064-$C067     | 49,252-49,255    | Input    | Paddle timers 0-3 (stub -- always expired) |
+
+### Table B: SoftSwitches Fields
+
+| Field     | Type   | Default | Tracks                                  |
+|-----------|--------|---------|-----------------------------------------|
+| KeyData   | uint8  | 0       | ASCII of most recent keypress           |
+| KeyReady  | bool   | false   | True if an unread keypress is waiting   |
+| TextMode  | bool   | true    | Text (true) vs graphics (false)         |
+| MixedMode | bool   | false   | Split-screen bottom text rows           |
+| Page2     | bool   | false   | Display page 1 (false) vs page 2 (true) |
+| HiRes     | bool   | false   | Lo-res (false) vs hi-res (true)         |
+
+### What Comes Next
+
+The next walkthrough covers `main.go`, the top-level wiring that instantiates RAM, ROM, softswitches, and the bus, maps them together, loads a ROM image, and calls `cpu.Run()` in a loop. That is the finale: after reading it, you will have walked through every line of the current emulator and understood how a working 6502 machine is assembled in Go one file at a time.
+
+If you are interested in how softswitch behavior is verified automatically, `io/softswitches_test.go` exercises the keyboard strobe and video mode flags and could be a companion walkthrough in the same style as the CPU test walkthrough.
+
+After the finale walkthrough, you will have read every line of the current emulator and understand how a working 6502 machine is assembled in Go one file at a time.

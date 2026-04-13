@@ -1,0 +1,741 @@
+# Educational Walkthrough: `memory/ram.go` and `memory/rom.go` -- The Apple II Memory Devices
+
+> This document walks through every line of `memory/ram.go` and `memory/rom.go` for someone who has never built a hardware emulator before. Each section explains **what** the code is, **why** it exists, **how** it works line by line, and provides a **real-world analogy** to build intuition.
+>
+> Prerequisite reading: `walkthrough_cpu_go.md`. You should already be comfortable with the 6502's 64 KB address space, pages, zero page, the stack, and the `cpu.Memory` interface. If any of those are fuzzy, revisit the CPU walkthrough first.
+
+---
+
+## Section 0: Background -- What Is Memory?
+
+### What It Is
+
+Memory, in the most general sense, is any device that responds to an address with data. Give it an address, and it gives you back a byte. Give it an address and a byte, and it stores that byte for later. That is the entire contract.
+
+In real hardware, many different types of chips can satisfy this contract. The two most important are **RAM** (Random Access Memory) and **ROM** (Read-Only Memory). They look the same from the CPU's perspective -- both answer to an address -- but they behave very differently on the write side.
+
+| Property        | RAM                          | ROM                                 |
+|-----------------|------------------------------|-------------------------------------|
+| Readable        | Yes                          | Yes                                 |
+| Writable        | Yes                          | No (writes silently ignored)        |
+| Keeps data off  | No (volatile)                | Yes (non-volatile)                  |
+| Typical use     | Variables, stack, screen buf | Boot code, BASIC, system routines   |
+| Real chip       | DRAM / SRAM                  | Mask ROM, PROM, EPROM               |
+| In this emu     | `memory.RAM`                 | `memory.ROM`                        |
+
+**Volatile** means the memory loses its contents the moment power is removed. Every byte in RAM becomes an unknown value the instant the machine switches off. **Non-volatile** means the contents survive power loss -- ROM chips remember their data forever (or for decades, in the case of EPROMs).
+
+### Why It Matters
+
+The Apple II uses both types simultaneously. RAM is the scratch pad -- programs compute into it, store results in it, push and pop the stack in it, and paint pixels into it. ROM is the permanent instruction set -- the built-in firmware that the CPU begins executing the instant it wakes up.
+
+### The Apple II 64 KB Layout
+
+The full address space of the 6502 is `$0000` (0) through `$FFFF` (65535) -- exactly 65,536 bytes, or 64 KB. Within that space, the Apple II assigns specific purposes to each region:
+
+```text
+$0000 +---------------------+
+      |  Zero Page (RAM)    |   256 bytes  -- fast variable slots
+$0100 +---------------------+
+      |  Stack (RAM)        |   256 bytes  -- hardwired page 1
+$0200 +---------------------+
+      |                     |
+      |  User RAM           |
+      |  (programs, data,   |
+      |   screen buffers)   |
+      |                     |
+$C000 +---------------------+
+      |  I/O (softswitches) |   covered in a later walkthrough
+$D000 +---------------------+
+      |                     |
+      |  ROM                |
+      |  (Applesoft BASIC,  |
+      |   Monitor, etc.)    |
+      |                     |
+$FFFA +---------------------+
+      |  Interrupt Vectors  |   NMI, Reset, IRQ (6 bytes)
+$FFFF +---------------------+
+```
+
+This map is abstract for now. By the end of this document you will understand exactly which Go type (`*memory.RAM` or `*memory.ROM`) is responsible for each region and how they get connected together.
+
+### The Role of the `memory` Package
+
+The `memory` package contains exactly two types: `RAM` and `ROM`. Both are **devices** -- they understand addresses and bytes, and they know nothing about the CPU or the bus. The CPU never touches them directly. Instead, an intermediate layer (the bus, covered in the next walkthrough) receives a `Read` or `Write` call from the CPU, decides which device owns that address, and forwards the call.
+
+The cross-layer picture looks like this:
+
+```text
++-----+   cpu.Memory      +-----+     bus.Device      +---------+
+| CPU | ----------------> | Bus | ------------------> |  RAM    |
+|     |   Read/Write      |     |  routes by address  |  ROM    |
+|     |                   |     |                     |  I/O    |
++-----+                   +-----+                     +---------+
+```
+
+In this document we zoom in on the two boxes on the right: `RAM` and `ROM`. The bus is the topic of the next walkthrough.
+
+---
+
+## Section 1: The Memory Interface Contract (Recap)
+
+Before reading the `RAM` and `ROM` source, it is worth restating the interface they must satisfy. This is a recap of Section 3 from `walkthrough_cpu_go.md`.
+
+```go
+type Memory interface {
+    Read(addr uint16) uint8
+    Write(addr uint16, val uint8)
+}
+```
+
+This interface lives in the `cpu` package. Both `RAM` and `ROM` satisfy it **without ever saying so explicitly**, because Go uses **structural typing** (also called "duck typing"): if a type has the right methods, it satisfies the interface automatically. There is no `implements` keyword, no `extends` clause, and no registration step. The compiler verifies at the point of use.
+
+The bus uses its own `bus.Device` interface for the same two methods. Because the signatures match, the same `*memory.RAM` and `*memory.ROM` values satisfy both interfaces with no extra work. This is the central design insight of the memory package: write it once, use it everywhere.
+
+| Type          | Read method   | Write method            | Satisfies                  |
+|---------------|---------------|-------------------------|----------------------------|
+| `*memory.RAM` | `Read(addr)`  | `Write(addr, val)`      | `cpu.Memory`, `bus.Device` |
+| `*memory.ROM` | `Read(addr)`  | `Write(addr, val)` (nop)| `cpu.Memory`, `bus.Device` |
+
+We will not explain how the bus actually routes addresses in this document -- that is the subject of the next walkthrough. For now, just trust that the bus hands each `Read`/`Write` to the correct device.
+
+---
+
+## Section 2: RAM (`memory/ram.go`)
+
+### What It Is
+
+Here is the complete source of `memory/ram.go`:
+
+```go
+package memory
+
+// RAM represents the Apple II's main memory (48 KB, expandable).
+// It stores data at the address directly — the bus handles range checking.
+type RAM struct {
+    Data [0x10000]uint8 // Full 64 KB backing store for simplicity
+}
+
+// NewRAM returns an initialised RAM (all zeroes).
+func NewRAM() *RAM {
+    return &RAM{}
+}
+
+// Read returns the byte at addr.
+func (r *RAM) Read(addr uint16) uint8 {
+    return r.Data[addr]
+}
+
+// Write stores val at addr.
+func (r *RAM) Write(addr uint16, val uint8) {
+    r.Data[addr] = val
+}
+```
+
+This type is the Apple II's main working memory. It is a dumb, mutable byte store. Every `Write` is remembered, every `Read` returns whatever was last written, and the contents are wiped to zero whenever a new `RAM` is created.
+
+### Why It Matters
+
+RAM holds everything that changes while a program runs:
+
+- **Program variables in zero page** (`$0000-$00FF`): The 6502 has special one-byte-address instructions for this region because they are one cycle faster. Apple II programmers packed their most-used variables here. As discussed in `walkthrough_cpu_go.md` Section 2.5, zero-page instructions save both code size and clock cycles.
+
+- **The call stack** (`$0100-$01FF`, page 1): When a subroutine is called with `JSR`, the return address is pushed onto the stack. The Stack Pointer register (`SP`) in the CPU struct holds the low-byte offset within page 1. The stack grows downward from `$01FF` toward `$0100`. Without RAM here, function calls would be impossible.
+
+- **Screen buffers**: The Apple II's text and hi-res graphics are stored in ordinary RAM that the video chip also reads simultaneously. The text screen lives at `$0400-$07FF` and the hi-res screen at `$2000-$3FFF`. Writing a character value to `$0400` causes it to appear on the display -- the same byte that sits in this RAM object. Video is covered in a later walkthrough.
+
+- **Any data your program computes**: intermediate arithmetic results, string buffers, file data loaded from disk -- all of it lands here.
+
+Without RAM, a program cannot store a single intermediate result. The ROM contains code to run, but code without a scratch pad cannot do anything useful. The ROM is the recipe; the RAM is the kitchen workspace.
+
+Volatility matters for the user experience too. The moment the Apple II's power switch is flipped off, every byte in RAM returns to an unknown state. This is why BASIC programs had to be saved to cassette tape or floppy disk -- they lived entirely in RAM and disappeared at power-off.
+
+### How the Code Works
+
+#### Line by line
+
+**`type RAM struct { Data [0x10000]uint8 }`**
+
+`[0x10000]uint8` is a **fixed-size array** (not a slice) of exactly `0x10000` = 65,536 = 64 * 1024 bytes. Let us decode the hex: `0x10000` = 1 * 16^4 = 65,536. That is the entire 64 KB address space.
+
+Why an array and not a slice?
+
+- The size is known at compile time -- no allocation surprises, no `make()` call.
+- Arrays are zero-initialised automatically by Go, so every byte starts at `0x00`. A fresh `RAM` is already clean.
+- Because the index type is `uint16` (which ranges `0x0000` to `0xFFFF`) and the array has exactly `0x10000` elements, the Go compiler can statically prove that any valid `uint16` is a valid array index. Out-of-bounds panics are impossible.
+- The array is embedded **by value** inside the struct. A single heap allocation gives you the entire 64 KB backing store. No pointer chasing, no cache misses following an extra pointer to a separately allocated slice backing array.
+
+Why `0x10000` bytes even though the real Apple II had only 48 KB of user RAM at `$0000-$BFFF`? **Simplicity.** The bus will only map the RAM device to the address ranges where RAM really exists on the Apple II. Even though this object can store all 64 KB, the ROM and I/O devices will overlay the upper regions in the bus's routing table. Any write the bus sends to this RAM lands in the backing store, but the bus never sends writes for addresses claimed by ROM. You may hear this called an *overprovisioned backing store* -- it trades 16 KB of unused capacity for a dramatically simpler `Read`/`Write` path.
+
+---
+
+**`func NewRAM() *RAM { return &RAM{} }`**
+
+This is the **constructor pattern** in Go: a function named `New` followed by the type name, returning a pointer to that type. Go has no built-in constructors (`__init__`, `constructor()`, etc.), so packages expose a `New` function by convention.
+
+Here the logic is trivial -- `&RAM{}` allocates a fresh `RAM` on the heap with all bytes zero-valued (Go guarantees zero-initialisation for all struct fields at allocation time). The function is still worth having because:
+
+- It gives callers an obvious entry point: `memory.NewRAM()`
+- It hides the struct literal syntax from consumers (callers do not need to know that `Data` is a field)
+- It provides a hook to add real initialisation logic later without changing any call sites
+
+---
+
+**`func (r *RAM) Read(addr uint16) uint8 { return r.Data[addr] }`**
+
+The receiver is `*RAM` (pointer to RAM), not `RAM` (value). This matters enormously: a **value receiver** would copy the entire 64 KB `Data` array on every call. At tens of millions of calls per second during emulation, that would be catastrophic for performance. A **pointer receiver** passes only an 8-byte pointer; the array itself stays put.
+
+`r.Data[addr]` is a direct array index. `addr` is already `uint16`, ranging `0` to `0xFFFF`, and the array has exactly `0x10000` elements -- so the compiler can prove the index is always in bounds. In practice this compiles down to a single `MOV` instruction on most architectures. No bounds check, no lock, no state mutation.
+
+---
+
+**`func (r *RAM) Write(addr uint16, val uint8) { r.Data[addr] = val }`**
+
+Symmetric to `Read`. Same pointer-receiver argument, same can-never-overflow argument.
+
+Because writes are unconditional, this `RAM` has no concept of a "protected" region. If you need a range of RAM to be unwritable, that protection must come from the bus layer -- the bus can simply refuse to route writes for certain address ranges to this device.
+
+---
+
+Here is a trace diagram showing what happens when the CPU writes a value:
+
+```text
+CPU:  Write($0200, 0x42)
+        |
+        v
+bus.Map routes $0200 to RAM
+        |
+        v
+RAM.Write(0x0200, 0x42)
+        |
+        v
+r.Data[0x0200] = 0x42   <-- byte at index 512 (decimal) is now 0x42
+```
+
+`$0200` in decimal is 2 * 256 = 512. The array slot at index 512 receives the value `0x42`.
+
+### Real-World Analogy
+
+RAM is a **whiteboard**. You can write anything in any cell, erase it, overwrite it. There are no locked sections, no permanent marks. The only limit is the size of the board (65,536 squares in our case).
+
+The moment someone turns off the lights in the room -- power-off -- every mark disappears. Tomorrow the board is blank.
+
+Extend the analogy to the memory map: zero page is the square of the whiteboard closest to your chair -- fastest to reach, most frequently used. The stack is a dedicated vertical strip along the right edge of the board that only grows downward as you jot reminders to yourself. The rest of the board is free scratch space for any intermediate work.
+
+The bus is the classroom rule that says "only write on the left half of the board" -- the physical whiteboard has more space, but the rule constrains which part you are allowed to use.
+
+---
+
+## Section 3: ROM (`memory/rom.go`)
+
+### What It Is
+
+Here is the complete source of `memory/rom.go`:
+
+```go
+package memory
+
+import (
+    "fmt"
+    "os"
+)
+
+// ROM is a read-only memory region loaded from a binary file.
+// It maps into the address space starting at Base.
+type ROM struct {
+    Data []uint8
+    Base uint16 // start address in the CPU address space
+}
+
+// LoadROM reads a binary file and creates a ROM mapped at base.
+// The ROM occupies [base, base+len(file)-1].
+func LoadROM(path string, base uint16) (*ROM, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, fmt.Errorf("load ROM %s: %w", path, err)
+    }
+    if len(data) == 0 {
+        return nil, fmt.Errorf("load ROM %s: file is empty", path)
+    }
+
+    end := int(base) + len(data) - 1
+    if end > 0xFFFF {
+        return nil, fmt.Errorf("load ROM %s: %d bytes at $%04X overflows address space",
+            path, len(data), base)
+    }
+
+    return &ROM{Data: data, Base: base}, nil
+}
+
+// Read returns the byte at addr. The caller (bus) guarantees addr is in range.
+func (r *ROM) Read(addr uint16) uint8 {
+    offset := addr - r.Base
+    if int(offset) < len(r.Data) {
+        return r.Data[offset]
+    }
+    return 0xFF
+}
+
+// Write is a no-op — ROM is read-only.
+func (r *ROM) Write(addr uint16, val uint8) {}
+
+// Size returns the number of bytes in the ROM image.
+func (r *ROM) Size() int {
+    return len(r.Data)
+}
+
+// End returns the last address occupied by this ROM (inclusive).
+func (r *ROM) End() uint16 {
+    return r.Base + uint16(len(r.Data)) - 1
+}
+```
+
+A `ROM` is a read-only memory region loaded from a binary file at emulator startup. It knows its own base address in the CPU address space, holds the file bytes in a slice, silently ignores writes, and reports its own size and end address so the bus can map it correctly.
+
+### Why It Matters
+
+On the real Apple II, ROM is a physical chip soldered (or socketed) onto the motherboard. The bits are burned in at the factory using a **mask ROM** process (the chip's internal structure is physically patterned with the data during manufacturing), or flashed once into an **EPROM** (Erasable Programmable ROM -- data can be erased under ultraviolet light and rewritten). Either way, once the chip exists on the board, its contents never change during normal operation.
+
+ROM contains the **firmware** -- the Apple II's built-in software:
+
+- **Power-on reset handler**: the code the CPU runs the microsecond after the reset button is released or the power turns on
+- **Applesoft BASIC**: a full BASIC interpreter baked into the chip; you could start programming the moment the machine booted, before loading anything from disk (Applesoft shipped with the Apple II+ in 1979; the original 1977 Apple II had Integer BASIC)
+- **The Monitor**: a built-in assembly-language debugger and memory inspector that engineers used to write and test machine code directly
+- **Character shapes**: the pixel patterns for text characters, stored as bitmaps for the video chip to read
+- **Disk II boot routines**: the code that knows how to load a program from a floppy disk
+
+Without ROM, the CPU has nothing to execute at power-on. RAM at power-on contains unpredictable garbage -- capacitors in the memory cells may have discharged unevenly, and the bits are meaningless. The 6502's very first act after coming out of reset is to read two bytes from the **reset vector** at `$FFFC`/`$FFFD` and load them into the Program Counter (`PC`). Those two bytes *must* be valid and *must* point to executable code, which means they *must* live in ROM.
+
+Here is the reset vector path drawn step by step:
+
+```text
+Power on
+   |
+   v
+CPU reads $FFFC, $FFFD   <-- these bytes live in ROM
+   |                         (guaranteed non-garbage)
+   v
+PC := (Data[$FFFD] << 8) | Data[$FFFC]   (little-endian: low byte first)
+   |
+   v
+CPU executes first instruction at PC
+   (this instruction is ROM code too)
+```
+
+This connects directly to `Reset()` in Section 5 of the CPU walkthrough, where you saw the CPU read two bytes from `$FFFC` and `$FFFD` to initialise `PC`. Without ROM mapped at those addresses, the emulator cannot boot.
+
+Different Apple II models shipped with different ROMs: the original Apple II (1977), the Apple II+ (1979, Applesoft BASIC added to ROM), the IIe (1983, enhanced character set, new firmware), the IIc (1984, built-in disk controller), and the IIgs (1986, 16-bit upgrade). Each model is distinguished primarily by the firmware in its ROM chips. In this emulator, swapping firmware is trivial: point `LoadROM` at a different binary file.
+
+### How the Code Works
+
+#### Imports
+
+```go
+import (
+    "fmt"
+    "os"
+)
+```
+
+- `os.ReadFile` is the standard library function that reads an entire file into a byte slice in one call. It opens the file, reads all bytes, closes the file, and returns them. Convenient for small files like ROM images (at most a few tens of kilobytes).
+- `fmt.Errorf` is like `fmt.Sprintf` but returns an `error` value instead of a string. Used throughout `LoadROM` to produce descriptive error messages.
+
+#### The `ROM` struct
+
+```go
+type ROM struct {
+    Data []uint8
+    Base uint16 // start address in the CPU address space
+}
+```
+
+`Data []uint8` is a **slice**, not an array. An array's length is part of its type: `[12288]uint8` and `[8192]uint8` are two completely different types in Go. A slice (`[]uint8`) works for any length -- it is a lightweight descriptor that points to an underlying array and remembers its length. Using a slice means the same `ROM` type can hold firmware images of any size: the 12 KB Apple II ROM, a 16 KB Apple IIe ROM, a tiny 256-byte test ROM. The file size drives the length at runtime.
+
+`Base uint16` records where this ROM image appears in the CPU's address space. A ROM binary file is just bytes numbered from 0. The `Base` field says "pretend byte 0 of this file lives at address `$D000` in the CPU's 64 KB map." It is a translation table compressed into a single number.
+
+Visually:
+
+```text
+Disk file:  [ b0 | b1 | b2 | ... | bN-1 ]
+              |    |    |           |
+              v    v    v           v
+CPU space: $D000 $D001 $D002 ... $D000+N-1
+            ^^^^
+            Base
+```
+
+#### `LoadROM(path, base) (*ROM, error)`
+
+```go
+func LoadROM(path string, base uint16) (*ROM, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, fmt.Errorf("load ROM %s: %w", path, err)
+    }
+    if len(data) == 0 {
+        return nil, fmt.Errorf("load ROM %s: file is empty", path)
+    }
+
+    end := int(base) + len(data) - 1
+    if end > 0xFFFF {
+        return nil, fmt.Errorf("load ROM %s: %d bytes at $%04X overflows address space",
+            path, len(data), base)
+    }
+
+    return &ROM{Data: data, Base: base}, nil
+}
+```
+
+**`data, err := os.ReadFile(path)`**
+
+`os.ReadFile` returns two values: the file contents as `[]uint8`, and an `error`. This is the standard Go two-value-return pattern for operations that can fail. If the file does not exist, `data` will be `nil` and `err` will be non-nil.
+
+---
+
+**`return nil, fmt.Errorf("load ROM %s: %w", path, err)`**
+
+`fmt.Errorf` creates a new `error` with a formatted message. The `%s` verb inserts the file path. The `%w` verb **wraps** the original error -- this is the difference between `%w` and `%v`:
+
+- `%v` formats the error as a string. You get a readable message, but the original error is lost.
+- `%w` wraps the original error inside the new one. Callers can later do `errors.Is(err, os.ErrNotExist)` to check whether the underlying cause was a missing file, even though the outer message says "load ROM apple2.rom: ...". Error context is preserved all the way up the call stack without losing the ability to inspect causes.
+
+---
+
+**`if len(data) == 0 { return nil, fmt.Errorf("load ROM %s: file is empty", path) }`**
+
+A zero-length ROM is almost certainly a mistake: a truncated download, a wrong file path pointing to an empty placeholder, or a build artifact that never got populated. The rest of the code assumes there is at least one byte. Failing immediately with a clear message is the "fail fast" principle -- catch the problem at the source rather than letting it produce a mysterious bug downstream.
+
+---
+
+**`end := int(base) + len(data) - 1`** and **`if end > 0xFFFF { ... }`**
+
+This is the most subtle check in the file.
+
+The 6502's address space ends at `$FFFF` (65535, decimal). If we place a ROM starting at `Base` and it has `N` bytes, it occupies addresses `Base` through `Base + N - 1` (inclusive). If `Base + N - 1` exceeds `$FFFF`, part of the ROM would "fall off" the end of the address space, which makes no physical sense.
+
+Why compute in `int` and not `uint16`? Consider: if `base` is `$F000` (61440) and `len(data)` is `$2000` (8192), then the true end is 61440 + 8192 - 1 = 69631 = `$10FFF`. That value does not fit in a `uint16`. Doing the addition in `uint16` would silently wrap around to `$0FFF` (modular arithmetic), and the overflow would go undetected. By converting `base` to `int` first, the addition uses `int` arithmetic, which is at least 32-bit wide on all Go targets -- wide enough to hold any `uint16 + uint16` sum without wrapping -- and the overflow becomes visible.
+
+Worked example:
+
+```text
+base = $F000  (61440 decimal)
+len  = $2000  ( 8192 decimal)
+end  = 61440 + 8192 - 1 = 69631 = $10FFF
+
+$10FFF > $FFFF  --> overflows the address space, reject with error
+```
+
+The error message uses `$%04X` to format `base` as a 4-digit, zero-padded, uppercase hex value (e.g., `$F000`). This matches the convention used throughout 6502 assembly and throughout this project.
+
+---
+
+**`return &ROM{Data: data, Base: base}, nil`**
+
+If all checks pass, build a `ROM` struct from the loaded file bytes and the caller-provided base address, and return a pointer to it with `nil` error.
+
+#### `Read(addr uint16) uint8`
+
+```go
+func (r *ROM) Read(addr uint16) uint8 {
+    offset := addr - r.Base
+    if int(offset) < len(r.Data) {
+        return r.Data[offset]
+    }
+    return 0xFF
+}
+```
+
+**`offset := addr - r.Base`**
+
+Translate the CPU address into a file offset. If `Base == $D000` and the CPU asks for `$D123`, then `offset == $D123 - $D000 == $0123` (291 decimal) -- that is the byte at file offset `$0123` (the 292nd byte if counting from 1, or index 291 if counting from 0). This arithmetic converts between the CPU's global address space and the ROM's local byte array.
+
+Subtraction in `uint16` is safe *only if* `addr >= Base`. The bus is supposed to guarantee this -- it should only route addresses within `[Base, End()]` to this device. If a bug in the bus ever sends a stray address that is less than `Base`, the `uint16` subtraction wraps around and `offset` becomes a very large number (`0x10000 - (Base - addr)`). That is exactly why the bounds check exists on the next line.
+
+---
+
+**`if int(offset) < len(r.Data) { return r.Data[offset] }`**
+
+The bounds check promotes `offset` to `int` before comparing with `len(r.Data)`. This conversion is **required by the language**: `len()` always returns `int` in Go, and Go's type system does not allow comparing a `uint16` with an `int` directly -- the mismatch is a **compile error**, not a warning, and it is not platform-specific. The cast is always safe here because we know from `LoadROM` that the ROM fits within 64 KB, so `offset` is at most `0xFFFF`.
+
+---
+
+**`return 0xFF`**
+
+If the offset falls outside the ROM's data, return `0xFF` (binary: `11111111`). This emulates **open bus** behavior on real hardware.
+
+On a physical Apple II, if the CPU reads from an address where no chip is active, no chip drives the data bus lines. The data bus has **pull-up resistors** -- passive components that hold each line at the high voltage level (logic `1`) when nothing else is pulling it low. Eight lines, all floating high:
+
+```text
+Real hardware -- nothing driving the data bus:
+
+    D7 D6 D5 D4 D3 D2 D1 D0
+     1  1  1  1  1  1  1  1    (pull-up resistors win)
+     |                    |
+     +--------------------+
+              0xFF
+```
+
+The pull-up model is a valid approximation, but the full hardware picture is more nuanced. On the real Apple II, the data bus is shared with the video circuitry, which performs its own DMA reads on every video scan cycle. In practice an open-bus read often returns whatever byte the video circuit fetched most recently -- not a clean `0xFF`. Returning `0xFF` is therefore a **common, deterministic emulator simplification** rather than a literal reproduction of Apple II hardware. It is predictable, harmless, and universally understood; the real bus residue would be unpredictable and harder to test against.
+
+Note that the bounds check is also **defense-in-depth**: in a correctly wired emulator the bus never sends an out-of-range address here, but if it does, the code degrades gracefully instead of panicking with an array index out of bounds.
+
+#### `Write(addr uint16, val uint8) {}`
+
+```go
+func (r *ROM) Write(addr uint16, val uint8) {}
+```
+
+The empty body is the whole feature. A write to ROM is a no-op.
+
+This is exactly how a real ROM chip behaves. The physical chip has a `WE` (Write Enable) pin that is simply never connected on the Apple II motherboard. When the CPU asserts the write signal, nothing on the ROM side reacts. The byte the CPU placed on the data bus evaporates when the bus cycle ends.
+
+Some emulators treat writes to ROM as a hard error and crash loudly. This emulator chooses the forgiving approach because:
+
+- Real Apple II software (including games and the Monitor) sometimes writes to addresses that happen to overlap or be adjacent to ROM regions. Crashing on such writes would make debugging painful and would break software that works correctly on real hardware.
+- Matching real hardware behavior -- silent no-op -- is easier to reason about than inventing a "helpful" emulator-only restriction that real hardware never had.
+
+One Go detail worth noting: unused method parameters are legal in Go. The compiler will not complain about `addr` and `val` never being used. This is unlike some languages (for example Rust, where you need `#[allow(unused)]`, or C++ where you might name them `/*addr*/`). The empty body is idiomatic Go.
+
+#### `Size()` and `End()`
+
+```go
+func (r *ROM) Size() int    { return len(r.Data) }
+func (r *ROM) End() uint16  { return r.Base + uint16(len(r.Data)) - 1 }
+```
+
+`Size()` returns the byte count of the loaded ROM image. It returns `int` because `len()` in Go always returns `int`.
+
+`End()` is more interesting. It returns the **last inclusive address** occupied by the ROM. The formula is `Base + N - 1` where `N` is the byte count, because the address range is inclusive on both ends. Worked example:
+
+```text
+Base = $D000  (53248 decimal)
+Size = $3000  (12288 decimal)
+End  = $D000 + $3000 - 1 = $FFFF  (65535 decimal)
+
+So the ROM occupies [$D000, $FFFF] inclusive -- exactly 12,288 bytes.
+```
+
+The cast `uint16(len(r.Data))` is safe because `LoadROM` already verified that `base + len - 1 <= 0xFFFF`, which means `len <= 0xFFFF + 1`, so the cast never overflows at runtime.
+
+These two helpers exist to make the bus wiring call site readable. The intended usage pattern:
+
+```go
+rom, _ := memory.LoadROM("apple2.rom", 0xD000)
+bus.Map(rom.Base, rom.End(), rom)
+```
+
+Without `End()`, every caller would have to compute `rom.Base + uint16(rom.Size()) - 1` themselves. That is both verbose and a repeated opportunity to forget the `- 1` (a classic off-by-one error that would make the bus map one byte short of the full ROM). Encapsulating the formula once is the DRY (Don't Repeat Yourself) principle in practice.
+
+### Real-World Analogy
+
+ROM is a **printed hardcover book**. You can open it to any page and read anything, but you cannot change a single letter. The ink is dry, the binding is sewn shut. If you want a different story, you need a different book.
+
+The file-based loading corresponds to "which book is sitting on the shelf." Shipping a different version of the Apple II firmware is like shipping a different book. The reader (CPU) does not know or care -- it just picks up whatever book is on the shelf starting at address `$D000`. The "shelf" is the bus's address map. Want to test with a stripped-down ROM? Swap the file. Want the full Apple IIe firmware? Swap the file.
+
+For the empty `Write`: imagine trying to scribble in the margin of that hardcover with a dry pen. Your hand moves through the motions, but no mark appears. The book is untouched. ROM writes are exactly that: the CPU completes its write cycle (the motion happens), but there is no physical change to the ROM chip (no mark appears).
+
+---
+
+## Section 4: Putting It Together -- The Apple II Memory Map
+
+### What It Is
+
+Now that you understand both `RAM` and `ROM`, we can see how they combine to produce the complete Apple II memory map. The diagram from Section 0 is repeated here with the emulator device names added:
+
+```text
+$0000 +---------------------+
+      |  Zero Page (RAM)    |   $0000..$00FF   -- *memory.RAM
+$0100 +---------------------+
+      |  Stack (RAM)        |   $0100..$01FF   -- *memory.RAM
+$0200 +---------------------+
+      |                     |
+      |  User RAM           |   $0200..$BFFF   -- *memory.RAM
+      |  (programs, data,   |
+      |   screen buffers)   |
+      |                     |
+$C000 +---------------------+
+      |  I/O (softswitches) |   $C000..$CFFF   -- (later walkthrough)
+$D000 +---------------------+
+      |                     |
+      |  ROM                |   $D000..$FFFF   -- *memory.ROM
+      |  (Applesoft BASIC,  |
+      |   Monitor, etc.)    |
+      |                     |
+$FFFA +---------------------+
+      |  Interrupt Vectors  |   $FFFA..$FFFF   -- inside ROM
+$FFFF +---------------------+
+```
+
+Translating each region to emulator devices and sizes:
+
+| Address range     | Size   | Device          | Notes                   |
+|-------------------|--------|-----------------|-------------------------|
+| `$0000` - `$BFFF` | 48 KB  | `*memory.RAM`   | zero page, stack, user  |
+| `$C000` - `$CFFF` |  4 KB  | I/O (later)     | keyboard, video, slots  |
+| `$D000` - `$FFFF` | 12 KB  | `*memory.ROM`   | firmware, reset vector  |
+
+`$D000` in decimal is 53,248. The ROM region spans from address 53,248 to 65,535 -- 12,288 bytes, or 12 KB.
+
+### How the Bus Stacks These (Forward Reference)
+
+The bus stores device mappings in a list. When a `Read` arrives, it walks the list and uses the **last** matching device (later mappings win). Writes follow the same rule.
+
+Typical wiring order when the emulator starts up:
+
+1. Map `RAM` across the full `$0000`-`$FFFF` range
+2. Map `ROM` on top of `$D000`-`$FFFF`
+3. (Later) map I/O devices on top of `$C000`-`$CFFF`
+
+Because of this stacking:
+
+- A **read** from `$D123` finds the ROM mapping (added last, so it wins), and returns the firmware byte at `offset = $D123 - $D000 = $0123`.
+- A **read** from `$0200` finds only the RAM mapping, returning whatever the program last wrote there.
+- A **write** to `$D123` is also routed to the ROM (last match wins), whose `Write` method is an empty body. The byte is silently discarded. The underlying RAM that also covers `$D123` is **not** touched.
+- A **write** to `$0200` goes straight to the RAM.
+
+```text
+CPU: Read($D100)
+
+  bus mappings (in order, last wins):
+    1. RAM  $0000..$FFFF
+    2. ROM  $D000..$FFFF   <-- matches, wins
+
+  -> ROM.Read($D100)
+  -> offset = $D100 - $D000 = $0100
+  -> return r.Data[0x0100]
+```
+
+```text
+CPU: Write($D100, $AA)
+
+  bus mappings (in order, last wins):
+    1. RAM  $0000..$FFFF
+    2. ROM  $D000..$FFFF   <-- matches, wins
+
+  -> ROM.Write($D100, $AA)
+  -> (empty body, nothing happens)
+  -> RAM at $D100 is NOT touched
+```
+
+### The Elegance of the Design
+
+The CPU code from the previous walkthrough has **not changed one byte** to support this. The `cpu.go` source still calls `c.Mem.Read(addr)` and `c.Mem.Write(addr, val)`. Whether the byte lives in RAM, ROM, or an I/O chip is completely invisible to the CPU. This is Dependency Inversion in action, applied to a real hardware boundary -- exactly as described in Section 3 of the CPU walkthrough.
+
+Adding new devices later (keyboard, display, disk controller) is a matter of writing a new type with `Read`/`Write` methods and registering it with the bus. No existing code -- not the CPU, not the RAM, not the ROM -- needs to know about the new device.
+
+---
+
+## Section 5: Design Decisions and Hardware Reality
+
+This section answers the "why" questions a curious reader would have after studying the code.
+
+#### Why is ROM's `Read` bounds-checked but RAM's `Read` is not?
+
+Because their backing stores have different relationships to the address space. RAM uses a `[0x10000]uint8` array -- exactly 65,536 slots for exactly 65,536 possible `uint16` addresses. The index can never be out of range; the type system guarantees it. No check is needed or possible.
+
+ROM, by contrast, uses a `[]uint8` slice whose length is determined at runtime by the file size. The ROM occupies a narrow range inside the larger 64 KB map (`$D000-$FFFF` in a typical wiring, not `$0000-$FFFF`). The slice length is only that narrow range; the `uint16` address space is much bigger. So the bounds check exists because a ROM slice index can be invalid in ways a RAM array index cannot.
+
+#### Why does ROM return `0xFF` on out-of-range reads instead of panicking?
+
+Open-bus convention (see the "Why 0xFF" explanation in Section 3 above). The short answer: on real hardware, when no chip drives the data bus, pull-up resistors float the lines high, which a 6502 reads as `11111111` = `0xFF`. This emulator follows the same convention.
+
+As noted in Section 3, `0xFF` is a **common, deterministic emulator simplification** rather than a literal reproduction of real Apple II hardware (where the bus residue from video DMA is often what you actually get). But it is predictable, harmless, and it matches the expectation of any 6502 programmer who has seen open-bus behavior: `0xFF` is not a documented 6502 opcode, so real code is extremely unlikely to execute it -- a read of `$FF` tends to cause predictable failure rather than silent misbehavior. Panicking instead would crash the emulator on a condition that real hardware handles silently.
+
+#### Why does the emulator allocate a full 64 KB RAM backing store when the real Apple II had only 48 KB?
+
+Simplicity. The bus controls which addresses are actually routed to the RAM device; the unused pages (`$C000-$FFFF`) are simply never reached by bus writes in a correctly wired emulator. The "extra" 16 KB costs 16 KB of host memory, which is a rounding error on any machine built after 1990. On the real Apple II, addresses above 48 KB (up to the I/O and ROM regions) simply had no RAM chips wired to them -- writing those addresses had no effect. The emulator reproduces that effect without reproducing the absence of the chips.
+
+#### Why is ROM loaded from a file instead of being baked into the Go binary?
+
+Copyright and legality. The Apple II's firmware -- the Monitor, Integer BASIC, Applesoft BASIC -- is copyrighted Apple material. An emulator author cannot redistribute it. Users must supply their own legally-obtained ROM dumps (typically from a machine they own). Keeping the ROM image as a separate file means the emulator itself contains no copyrighted Apple code and can be distributed freely. Users swap in their own ROM file at startup.
+
+There are also practical benefits: different Apple II models have different ROMs, and a developer building custom firmware can swap in a test image without rebuilding the emulator. Both advantages flow from the same design decision.
+
+#### What is the relationship between a ROM file on disk and a ROM chip on the real motherboard?
+
+One-to-one. A real Apple II had physical EPROM or mask ROM chips soldered to the motherboard at fixed address ranges. A ROM file is a byte-for-byte dump of what those chips would return if you read every address in sequence. Loading the file into `ROM.Data` reconstructs that same bit pattern in Go memory. From the CPU's point of view, there is no difference between reading from the physical chip and reading from the slice:
+
+```text
+REAL APPLE II                          EMULATOR
++-------------------+                  +-------------------+
+|  Motherboard      |                  |  rom.bin file     |
+|                   |                  |                   |
+|  +------------+   |                  |  byte 0: $4C      |
+|  | ROM chip   |   |   byte-for-byte  |  byte 1: $00      |
+|  | (Applesoft)| - - - - - - - - - ->|  byte 2: $E0      |
+|  |  at $D000  |   |                  |  ...              |
+|  +------------+   |                  |  byte 0x2FFF: $60 |
+|  +------------+   |                  +-------------------+
+|  | ROM chip   |   |                           |
+|  | (Monitor)  |   |                    LoadROM("rom.bin",
+|  |  at $F800  |   |                            0xD000)
+|  +------------+   |                           |
+|                   |                           v
+|  CPU reads $D100 -+-> electrical ------> rom.Read($D100)
+|                   |    signal flows            |
++-------------------+    through chip            v
+                         select line       Data[$D100 - $D000]
+                                         = Data[$0100] = byte 256
+                                           of the file
+```
+
+The chip was silicon you could physically touch; the file is a snapshot of that silicon's contents. The CPU cannot tell the difference -- both return the same byte for the same address.
+
+#### Why does `LoadROM` use `fmt.Errorf("... %w", err)` instead of `%v`?
+
+`%w` **wraps** the original error so callers can use `errors.Is(err, os.ErrNotExist)` or `errors.As` to inspect the underlying cause. `%v` merely formats the error's text into a string, discarding the original error's identity. For a loader function that can fail in several ways (file not found, file empty, address overflow), wrapping with `%w` preserves the full diagnostic chain all the way up the call stack. Using `%v` would make the error message readable but strip out the information that lets callers handle specific failure modes programmatically.
+
+---
+
+## Section 6: Quick Reference
+
+`RAM` is mutable, volatile, and backed by a 64 KB fixed-size array that is directly indexed with no bounds check -- a safe design because `uint16` addresses can never exceed the array bounds. `ROM` is immutable, persistent, and loaded from a file at startup; it bounds-checks every read and silently ignores every write, matching the behavior of the physical chips it replaces. Both types satisfy the same two-method interface (`Read` and `Write`), and they do so without ever declaring it -- Go's structural typing makes them interchangeable anywhere the bus or CPU expects a memory device. The bus layers them together to produce the Apple II memory map, and the CPU never needs to know which type is answering its requests.
+
+> **Take-home idea:** The same `Read`/`Write` interface that the CPU already uses to talk to "memory" also lets us plug in RAM, ROM, or any other device the Apple II cared about -- without changing a single line of CPU code. That is Dependency Inversion doing real work.
+
+---
+
+### `memory.RAM` at a Glance
+
+| Item           | Value                        |
+|----------------|------------------------------|
+| Backing store  | `[0x10000]uint8` (65,536 bytes) |
+| Constructor    | `memory.NewRAM()`            |
+| Read cost      | 1 array index                |
+| Write cost     | 1 array index assignment     |
+| Initial state  | All `0x00`                   |
+| Satisfies      | `cpu.Memory`, `bus.Device`   |
+
+### `memory.ROM` at a Glance
+
+| Item           | Value                                      |
+|----------------|--------------------------------------------|
+| Backing store  | `[]uint8` (slice, size = file size)        |
+| Constructor    | `memory.LoadROM(path, base)`               |
+| Read cost      | 1 subtraction + 1 bounds check + 1 index  |
+| Write cost     | Nothing (empty body)                       |
+| Out-of-range   | Returns `0xFF` (open bus)                  |
+| Satisfies      | `cpu.Memory`, `bus.Device`                 |
+
+### Complete Address Map Summary
+
+```text
+$0000..$00FF  Zero Page   RAM   256 bytes  fast variables
+$0100..$01FF  Stack       RAM   256 bytes  SP grows down from $01FF
+$0200..$BFFF  User RAM    RAM   ~48 KB     programs, screen buffers
+$C000..$CFFF  I/O         ---    4 KB      softswitches (next walkthrough)
+$D000..$FFFF  ROM         ROM   12 KB      firmware, reset at $FFFC/$FFFD
+```
+
+---
+
+## What Comes Next
+
+You now understand both memory device types and how they model the physical chips on the Apple II motherboard. The next walkthrough covers `bus/bus.go`, which explains:
+
+- How the bus stores its list of device mappings
+- The exact routing algorithm (last match wins)
+- How the I/O region at `$C000-$CFFF` fits in (softswitches, keyboard, video)
+- Bank switching and the language card (how the Apple II adds extra RAM above `$BFFF`)
+
+After the bus walkthrough, the emulator's memory system will be fully clear end-to-end: from a CPU `Read($FFFC)` call, through the bus, into the ROM object, down to the `r.Data[0x2FFC]` array access that returns the first byte of the reset vector.
