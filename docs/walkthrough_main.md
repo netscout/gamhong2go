@@ -1,58 +1,26 @@
 # Educational Walkthrough: `main.go` -- The Phase 4 SDL Interactive Emulator
 
-> This is the new finale of the emulator walkthrough series. You have
-> already seen the CPU execute 6502 instructions, RAM and ROM hold bytes, a
-> bus router dispatch reads and writes, softswitches translate memory
-> accesses into hardware commands, a character generator decode screen bytes
-> into dot patterns, and a video renderer convert those patterns into an
-> RGBA pixel buffer. `main.go` is where all those parts run simultaneously
-> -- where a command-line flag becomes a loaded ROM, a ROM becomes a mapped
-> device, a device becomes a booted CPU, a booted CPU drives a text screen,
-> and that text screen appears in a real window at 60 frames per second.
-> Phase 4 is not a diagnostic harness. It is an interactive emulator.
+> This is the new finale of the emulator walkthrough series. You have already seen the CPU execute 6502 instructions, RAM and ROM hold bytes, a bus router dispatch reads and writes, softswitches translate memory accesses into hardware commands, a character generator decode screen bytes into dot patterns, and a video renderer convert those patterns into an RGBA pixel buffer. `main.go` is where all those parts run simultaneously -- where a command-line flag becomes a loaded ROM, a ROM becomes a mapped device, a device becomes a booted CPU, a booted CPU drives a text screen, and that text screen appears in a real window at 60 frames per second. Phase 4 is not a diagnostic harness. It is an interactive emulator.
 
 ---
 
 ## Section 0: Background -- What `main.go` Does at Phase 4
 
-You have read seven walkthroughs in this series. Each one described a
-package in isolation:
+You have read seven walkthroughs in this series. Each one described a package in isolation:
 
-- **`walkthrough_cpu_go.md`** -- the MOS 6502 CPU: registers, flags,
-  addressing modes, the fetch-decode-execute loop, and how `Step()` returns
-  a cycle count.
-- **`walkthrough_cpu_test_go.md`** -- the Klaus Dormann functional test
-  suite: how we verify the CPU against a 65K-instruction ROM that exercises
-  every opcode, mode, and flag.
-- **`walkthrough_memory.md`** -- RAM and ROM: how 64 KB of byte storage is
-  divided into pages, how `LoadROM` maps a binary file to a base address,
-  and how ROM blocks writes while passing reads through.
-- **`walkthrough_bus.md`** -- the bus router: how `Map` registers address
-  regions, how `Read`/`Write` dispatch to the right device, how last-match-
-  wins overlays work, and what open-bus fallback means.
-- **`walkthrough_io.md`** -- softswitches: how memory-mapped I/O works on
-  the Apple II, how a read at `$C054` (49,236) is itself a video-mode
-  command, and how the softswitch block plugs into the bus.
-- **`walkthrough_chargen.md`** -- the character generator ROM: how 7x8 dot
-  patterns are stored, how the character code byte maps to a row address,
-  and how the flash bit works.
-- **`walkthrough_video.md`** -- the video renderer: how the 40-column text
-  screen lives in RAM at `$0400`-`$07FF` (1,024-2,047), how each character
-  code maps to pixels via the character generator, and how an RGBA32 pixel
-  buffer is produced for SDL2.
+- **`walkthrough_cpu_go.md`** -- the MOS 6502 CPU: registers, flags, addressing modes, the fetch-decode-execute loop, and how `Step()` returns a cycle count.
+- **`walkthrough_cpu_test_go.md`** -- the Klaus Dormann functional test suite: how we verify the CPU against a 65K-instruction ROM that exercises every opcode, mode, and flag.
+- **`walkthrough_memory.md`** -- RAM and ROM: how 64 KB of byte storage is divided into pages, how `LoadROM` maps a binary file to a base address, and how ROM blocks writes while passing reads through.
+- **`walkthrough_bus.md`** -- the bus router: how `Map` registers address regions, how `Read`/`Write` dispatch to the right device, how last-match- wins overlays work, and what open-bus fallback means.
+- **`walkthrough_io.md`** -- softswitches: how memory-mapped I/O works on the Apple II, how a read at `$C054` (49,236) is itself a video-mode command, and how the softswitch block plugs into the bus.
+- **`walkthrough_chargen.md`** -- the character generator ROM: how 7x8 dot patterns are stored, how the character code byte maps to a row address, and how the flash bit works.
+- **`walkthrough_video.md`** -- the video renderer: how the 40-column text screen lives in RAM at `$0400`-`$07FF` (1,024-2,047), how each character code maps to pixels via the character generator, and how an RGBA32 pixel buffer is produced for SDL2.
 
-Every one of those walkthroughs ended with a forward pointer: "this piece
-becomes useful when `main.go` wires it together." This is where they
-converge.
+Every one of those walkthroughs ended with a forward pointer: "this piece becomes useful when `main.go` wires it together." This is where they converge.
 
 ### This Walkthrough Replaces `walkthrough_main_phase3.md`
 
-This document **replaces** `walkthrough_main_phase3.md`, which covered the
-Phase 3 trace harness -- a command-line tool that loaded a ROM, booted the
-CPU, and printed a disassembly trace to stdout. Phase 3 was a diagnostic
-tool; Phase 4 is an interactive emulator. `walkthrough_main_phase3.md`
-remains as a historical document; it is referenced here wherever Phase 3
-details are still relevant (flag parsing, `loadROM`, import structure).
+This document **replaces** `walkthrough_main_phase3.md`, which covered the Phase 3 trace harness -- a command-line tool that loaded a ROM, booted the CPU, and printed a disassembly trace to stdout. Phase 3 was a diagnostic tool; Phase 4 is an interactive emulator. `walkthrough_main_phase3.md` remains as a historical document; it is referenced here wherever Phase 3 details are still relevant (flag parsing, `loadROM`, import structure).
 
 ### What Phase 4 Includes
 
@@ -84,8 +52,7 @@ belongs in debugging tools)
 
 ### What Phase 4 Does Not Yet Include
 
-Phase 4 is feature-complete for text-mode Apple II interaction but is not a
-full emulator. Still missing:
+Phase 4 is feature-complete for text-mode Apple II interaction but is not a full emulator. Still missing:
 
 - Audio output (speaker-toggle `$C030` to PCM waveform conversion)
 - Lo-res graphics mode (GR) -- reinterpreting `$0400`-`$07FF` bytes as 40x48
@@ -416,65 +383,31 @@ func loadROM(path string) (*memory.ROM, error) {
 
 ### What It Is
 
-The import block on lines 3-17 lists eleven packages: five from the Go
-standard library (`flag`, `fmt`, `os`, `time`, `unsafe`) and six external to
-the standard library (one external third-party package:
-`github.com/veandco/go-sdl2/sdl`; five internal packages: `bus`, `cpu`, `io`
-aliased as `appleio`, `memory`, `video`).
+The import block on lines 3-17 lists eleven packages: five from the Go standard library (`flag`, `fmt`, `os`, `time`, `unsafe`) and six external to the standard library (one external third-party package: `github.com/veandco/go-sdl2/sdl`; five internal packages: `bus`, `cpu`, `io` aliased as `appleio`, `memory`, `video`).
 
 ### Why It Matters
 
-The import block is the dependency manifest of the program. Reading it tells
-you exactly what capabilities `main.go` draws on before you read a single
-line of logic. Compared to Phase 3, two new standard library imports appear
--- `time` (frame timing and the FPS counter) and `unsafe` (passing a Go
-slice pointer to SDL's C texture upload function) -- and two new package
-dependencies appear: the external `go-sdl2` binding and the internal `video`
-package. The `appleio` alias (line 14) persists from Phase 3 because the
-internal package is named `io`, which would shadow the standard library's
-`io` package if imported without an alias. For the Phase 3 explanation of
-this alias, see walkthrough_main_phase3.md Section 1.
+The import block is the dependency manifest of the program. Reading it tells you exactly what capabilities `main.go` draws on before you read a single line of logic. Compared to Phase 3, two new standard library imports appear -- `time` (frame timing and the FPS counter) and `unsafe` (passing a Go slice pointer to SDL's C texture upload function) -- and two new package dependencies appear: the external `go-sdl2` binding and the internal `video` package. The `appleio` alias (line 14) persists from Phase 3 because the internal package is named `io`, which would shadow the standard library's `io` package if imported without an alias. For the Phase 3 explanation of this alias, see walkthrough_main_phase3.md Section 1.
 
 ### How the Code Works
 
 Each import serves a specific role:
 
-- **`flag`** (line 4) -- parses the `--rom` command-line argument. Same role
-  as Phase 3.
-- **`fmt`** (line 5) -- formatted printing: startup banner, error messages,
-  FPS counter title.
-- **`os`** (line 6) -- `os.Stat` in `loadROM`, `os.Stderr` for error output,
-  `os.Exit(1)` on fatal errors.
-- **`time`** (line 7) -- **new in Phase 4**: `time.Now()` captures frame
-  start times; `time.Since()` measures elapsed time; `time.Second /
-  targetFPS` computes the 16.67ms target frame duration. Phase 3 had no
-  timing code.
-- **`unsafe`** (line 8) -- **new in Phase 4**: `unsafe.Pointer` converts a
-  Go slice reference to a raw C pointer so SDL's `texture.Update` function
-  (written in C) can read the pixel buffer directly. This is one of the few
-  legitimate uses of the `unsafe` package: the slice is allocated by
-  `make()`, lives for the program's lifetime, and outlives the C call.
-- **`github.com/veandco/go-sdl2/sdl`** (line 10) -- **new in Phase 4**: Go
-  bindings for libSDL2, implemented via CGo (C-Go interoperability). This is
-  not a pure Go library; it calls C functions from the SDL2 dynamic library
-  installed on the system. The CGo layer introduces the type-casting
-  requirement discussed in Sub-section 3e.
+- **`flag`** (line 4) -- parses the `--rom` command-line argument. Same role as Phase 3.
+- **`fmt`** (line 5) -- formatted printing: startup banner, error messages, FPS counter title.
+- **`os`** (line 6) -- `os.Stat` in `loadROM`, `os.Stderr` for error output, `os.Exit(1)` on fatal errors.
+- **`time`** (line 7) -- **new in Phase 4**: `time.Now()` captures frame start times; `time.Since()` measures elapsed time; `time.Second / targetFPS` computes the 16.67ms target frame duration. Phase 3 had no timing code.
+- **`unsafe`** (line 8) -- **new in Phase 4**: `unsafe.Pointer` converts a Go slice reference to a raw C pointer so SDL's `texture.Update` function (written in C) can read the pixel buffer directly. This is one of the few legitimate uses of the `unsafe` package: the slice is allocated by `make()`, lives for the program's lifetime, and outlives the C call.
+- **`github.com/veandco/go-sdl2/sdl`** (line 10) -- **new in Phase 4**: Go bindings for libSDL2, implemented via CGo (C-Go interoperability). This is not a pure Go library; it calls C functions from the SDL2 dynamic library installed on the system. The CGo layer introduces the type-casting requirement discussed in Sub-section 3e.
 - **`bus`** (line 12) -- the address bus router.
 - **`cpu`** (line 13) -- the MOS 6502 CPU.
-- **`appleio`** (line 14) -- the softswitch I/O block, aliased to avoid
-  shadowing `io`.
+- **`appleio`** (line 14) -- the softswitch I/O block, aliased to avoid shadowing `io`.
 - **`memory`** (line 15) -- RAM and ROM types.
-- **`video`** (line 16) -- **new in Phase 4**: the text-mode video renderer;
-  provides `NewVideo`, `RenderText`, `ScreenW`, `ScreenH`, and the `Pixels`
-  buffer. Not present in Phase 3.
+- **`video`** (line 16) -- **new in Phase 4**: the text-mode video renderer; provides `NewVideo`, `RenderText`, `ScreenW`, `ScreenH`, and the `Pixels` buffer. Not present in Phase 3.
 
 ### Real-World Analogy
 
-The import block is the ingredient list for a recipe. Phase 3's list was
-modest: flour, eggs, and butter (text output, flag parsing, file I/O). Phase
-4 adds a display case (`go-sdl2`), a kitchen timer (`time`), and a
-specialized tool for handling raw materials directly (`unsafe`). You cannot
-make the dish without knowing what goes in it.
+The import block is the ingredient list for a recipe. Phase 3's list was modest: flour, eggs, and butter (text output, flag parsing, file I/O). Phase 4 adds a display case (`go-sdl2`), a kitchen timer (`time`), and a specialized tool for handling raw materials directly (`unsafe`). You cannot make the dish without knowing what goes in it.
 
 ---
 
@@ -482,49 +415,26 @@ make the dish without knowing what goes in it.
 
 ### What It Is
 
-The `const` block on lines 19-29 defines six constants that govern the
-emulator's timing and display geometry: `cpuClock`, `targetFPS`,
-`cyclesPerFrame`, `windowScale`, `windowW`, and `windowH`.
+The `const` block on lines 19-29 defines six constants that govern the emulator's timing and display geometry: `cpuClock`, `targetFPS`, `cyclesPerFrame`, `windowScale`, `windowW`, and `windowH`.
 
 ### Why It Matters
 
-These six constants encode the fundamental parameters of Apple II emulation.
-They connect three different domains: the 1.023 MHz CPU clock of 1977
-hardware, the 60 Hz NTSC refresh rate that television sets expected, and the
-pixel dimensions of a modern display window. Getting these numbers right
-means the emulator runs at the correct speed. Getting them wrong means the
-CPU runs too fast (corrupting timing-sensitive ROM routines) or too slow
-(making the machine feel sluggish).
+These six constants encode the fundamental parameters of Apple II emulation. They connect three different domains: the 1.023 MHz CPU clock of 1977 hardware, the 60 Hz NTSC refresh rate that television sets expected, and the pixel dimensions of a modern display window. Getting these numbers right means the emulator runs at the correct speed. Getting them wrong means the CPU runs too fast (corrupting timing-sensitive ROM routines) or too slow (making the machine feel sluggish).
 
 ### How the Code Works
 
-- **`cpuClock = 1023000`** -- the Apple II's clock speed in cycles per
-  second. This is 1.023 MHz, not a round 1 MHz. The oddball frequency comes
-  from the NTSC color burst crystal: 14.31818 MHz divided by 14 gives
-  1.02273 MHz, which rounds to 1.023 MHz. Using the actual frequency rather
-  than 1 MHz keeps timing-sensitive sound and I/O routines accurate.
+- **`cpuClock = 1023000`** -- the Apple II's clock speed in cycles per second. This is 1.023 MHz, not a round 1 MHz. The oddball frequency comes from the NTSC color burst crystal: 14.31818 MHz divided by 14 gives
+1.02273 MHz, which rounds to 1.023 MHz. Using the actual frequency rather than 1 MHz keeps timing-sensitive sound and I/O routines accurate.
 
-- **`targetFPS = 60`** -- the NTSC video refresh rate. The Apple II's video
-  hardware is designed to match 60 Hz exactly, so the emulator targets the
-  same rate.
+- **`targetFPS = 60`** -- the NTSC video refresh rate. The Apple II's video hardware is designed to match 60 Hz exactly, so the emulator targets the same rate.
 
-- **`cyclesPerFrame = cpuClock / targetFPS`** = 1,023,000 / 60 = 17,050 --
-  the number of CPU cycles to execute per rendered frame. The comment says
-  "~17050" but the division is exact: 1,023,000 / 60 = 17,050.0 with no
-  remainder.
+- **`cyclesPerFrame = cpuClock / targetFPS`** = 1,023,000 / 60 = 17,050 -- the number of CPU cycles to execute per rendered frame. The comment says "~17050" but the division is exact: 1,023,000 / 60 = 17,050.0 with no remainder.
 
-- **`windowScale = 3`** -- scaling factor from native Apple II pixels to
-  window pixels. A 1:1 window would be 280x192 pixels, which is tiny on a
-  modern 2K or 4K display. 3x gives 840x576, comfortably visible at normal
-  viewing distances.
+- **`windowScale = 3`** -- scaling factor from native Apple II pixels to window pixels. A 1:1 window would be 280x192 pixels, which is tiny on a modern 2K or 4K display. 3x gives 840x576, comfortably visible at normal viewing distances.
 
-- **`windowW = video.ScreenW * windowScale`** -- uses the exported `ScreenW`
-  constant from the `video` package (see walkthrough_video.md Section 1).
-  `video.ScreenW` is 280; multiplied by 3 gives 840. The comment confirms
-  this: `// 840`.
+- **`windowW = video.ScreenW * windowScale`** -- uses the exported `ScreenW` constant from the `video` package (see walkthrough_video.md Section 1). `video.ScreenW` is 280; multiplied by 3 gives 840. The comment confirms this: `// 840`.
 
-- **`windowH = video.ScreenH * windowScale`** -- same pattern:
-  `video.ScreenH` is 192; multiplied by 3 gives 576.
+- **`windowH = video.ScreenH * windowScale`** -- same pattern: `video.ScreenH` is 192; multiplied by 3 gives 576.
 
 ### Diagram 2: Frame Budget Derivation
 
@@ -544,12 +454,7 @@ CPU runs too fast (corrupting timing-sensitive ROM routines) or too slow
 
 ### Real-World Analogy
 
-A film projector runs at 24 frames per second. Each frame gets a fixed
-amount of screen time -- roughly 41 milliseconds. The Apple II's "projector"
-runs at 60 fps, so each frame gets 16.67 milliseconds. In that window, the
-CPU must execute exactly 17,050 instructions' worth of work, the screen must
-be re-rendered, and the frame must be presented. If the work finishes early,
-the projector waits; if it overruns, the next frame starts immediately.
+A film projector runs at 24 frames per second. Each frame gets a fixed amount of screen time -- roughly 41 milliseconds. The Apple II's "projector" runs at 60 fps, so each frame gets 16.67 milliseconds. In that window, the CPU must execute exactly 17,050 instructions' worth of work, the screen must be re-rendered, and the frame must be presented. If the work finishes early, the projector waits; if it overruns, the next frame starts immediately.
 
 **Cross-references:**
 - walkthrough_video.md Section 1 (where `ScreenW = 280` and `ScreenH = 192`
@@ -561,33 +466,17 @@ concepts)
 
 ## Section 3: `main()` -- The Entry Point (lines 31-168)
 
-The `main()` function (line 31 opens, line 168 closes) is 137 lines of
-straight-line startup code followed by an event loop. Its internal comment
-headers divide it into five phases: Load ROM, Wire the bus, Init CPU, Init
-video, Init SDL2, and the Main loop. The sub-sections below follow those
-headers.
+The `main()` function (line 31 opens, line 168 closes) is 137 lines of straight-line startup code followed by an event loop. Its internal comment headers divide it into five phases: Load ROM, Wire the bus, Init CPU, Init video, Init SDL2, and the Main loop. The sub-sections below follow those headers.
 
 ### Sub-section 3a: Flag Parsing and ROM Loading (lines 32-43)
 
-**What It Is**: Lines 32-43 parse the `--rom` command-line flag and call
-`loadROM` to read the ROM file from disk.
+**What It Is**: Lines 32-43 parse the `--rom` command-line flag and call `loadROM` to read the ROM file from disk.
 
-**How the Code Works**: `flag.String("rom", "roms/Apple2_Plus.rom", ...)`
-registers a string flag with the default path `roms/Apple2_Plus.rom`. Note
-the capitalization: Phase 3 used `apple2plus.rom` (all lowercase); Phase 4
-uses `Apple2_Plus.rom` (mixed case matching the common distribution
-filename). After `flag.Parse()`, the pointer `*romPath` holds the user-
-supplied path or the default.
+**How the Code Works**: `flag.String("rom", "roms/Apple2_Plus.rom", ...)` registers a string flag with the default path `roms/Apple2_Plus.rom`. Note the capitalization: Phase 3 used `apple2plus.rom` (all lowercase); Phase 4 uses `Apple2_Plus.rom` (mixed case matching the common distribution filename). After `flag.Parse()`, the pointer `*romPath` holds the user- supplied path or the default.
 
-If `loadROM` returns an error, `main` prints the error to `os.Stderr` and
-exits with code 1. The error message in Phase 4 is shorter than Phase 3's --
-it gives only the three-line directory setup hint, not the multi-line list
-of common ROM sizes. The `--trace` flag from Phase 3 is completely gone;
-Phase 4 does not expose a trace mode.
+If `loadROM` returns an error, `main` prints the error to `os.Stderr` and exits with code 1. The error message in Phase 4 is shorter than Phase 3's -- it gives only the three-line directory setup hint, not the multi-line list of common ROM sizes. The `--trace` flag from Phase 3 is completely gone; Phase 4 does not expose a trace mode.
 
-**Differences from Phase 3**: The `--trace` flag and `traceCount` variable
-no longer exist. The default ROM filename changed. The error message was
-shortened (removed the "Common ROM sizes" block).
+**Differences from Phase 3**: The `--trace` flag and `traceCount` variable no longer exist. The default ROM filename changed. The error message was shortened (removed the "Common ROM sizes" block).
 
 **Cross-references:**
 - walkthrough_main_phase3.md Section 2a (original flag parsing explanation)
@@ -597,8 +486,7 @@ shortened (removed the "Common ROM sizes" block).
 
 ### Sub-section 3b: Wiring the Bus (lines 45-55)
 
-**What It Is**: Lines 45-55 construct the three core hardware devices and
-connect them to the address bus via three `Map` calls.
+**What It Is**: Lines 45-55 construct the three core hardware devices and connect them to the address bus via three `Map` calls.
 
 **How the Code Works**:
 
@@ -612,32 +500,17 @@ b.Map(0xC000, 0xC0FF, sw)
 b.Map(rom.Base, rom.End(), rom)
 ```
 
-`memory.NewRAM()` allocates 65,536 (0x10000) bytes of zero-filled RAM (see
-walkthrough_memory.md Section 2). `appleio.NewSoftSwitches()` constructs the
-I/O softswitch block that handles the `$C000`-`$C0FF` (49,152-49,407)
-address range (see walkthrough_io.md Section 2). `bus.NewBus()` creates an
-empty address bus with no mappings yet.
+`memory.NewRAM()` allocates 65,536 (0x10000) bytes of zero-filled RAM (see walkthrough_memory.md Section 2). `appleio.NewSoftSwitches()` constructs the I/O softswitch block that handles the `$C000`-`$C0FF` (49,152-49,407) address range (see walkthrough_io.md Section 2). `bus.NewBus()` creates an empty address bus with no mappings yet.
 
 The three `Map` calls register the memory map:
 
-1. `b.Map(0x0000, 0xBFFF, ram)` -- RAM covers `$0000`-`$BFFF` (0-49,151),
-the lower 48 KB.
-2. `b.Map(0xC000, 0xC0FF, sw)` -- I/O softswitches cover `$C000`-`$C0FF`
-(49,152-49,407), the 256-byte I/O page.
-3. `b.Map(rom.Base, rom.End(), rom)` -- the ROM is mapped at whatever base
-address `loadROM` detected (either `$D000` at 53,248 for 12 KB, or `$C000`
-at 49,152 for 16 KB).
+1. `b.Map(0x0000, 0xBFFF, ram)` -- RAM covers `$0000`-`$BFFF` (0-49,151), the lower 48 KB.
+2. `b.Map(0xC000, 0xC0FF, sw)` -- I/O softswitches cover `$C000`-`$C0FF` (49,152-49,407), the 256-byte I/O page.
+3. `b.Map(rom.Base, rom.End(), rom)` -- the ROM is mapped at whatever base address `loadROM` detected (either `$D000` at 53,248 for 12 KB, or `$C000` at 49,152 for 16 KB).
 
-The bus uses last-match-wins ordering (see walkthrough_bus.md Section 4), so
-the ROM overlay on top of RAM is correct: a read at `$D000` finds the ROM
-entry registered after the RAM entry.
+The bus uses last-match-wins ordering (see walkthrough_bus.md Section 4), so the ROM overlay on top of RAM is correct: a read at `$D000` finds the ROM entry registered after the RAM entry.
 
-**Variable naming**: `ram`, `sw`, `vid`, and `c` are brief single-word
-identifiers. The bus is simply `b`. This follows Go's convention that short
-variable names are acceptable when the type is unambiguous from context (`b
-:= bus.NewBus()` leaves no doubt). The `b.Dump()` call present in Phase 3 is
-gone -- Phase 4 is a graphical application and does not print bus maps to
-stdout.
+**Variable naming**: `ram`, `sw`, `vid`, and `c` are brief single-word identifiers. The bus is simply `b`. This follows Go's convention that short variable names are acceptable when the type is unambiguous from context (`b := bus.NewBus()` leaves no doubt). The `b.Dump()` call present in Phase 3 is gone -- Phase 4 is a graphical application and does not print bus maps to stdout.
 
 **Cross-references:**
 - walkthrough_bus.md Section 4 (Map, last-match-wins ordering)
@@ -658,21 +531,11 @@ c.Reset()
 fmt.Printf("Reset vector: $%04X\n", c.PC)
 ```
 
-`cpu.NewCPU(b)` takes the bus as its only argument. The CPU does not know
-about RAM, ROM, or I/O directly -- the bus is the CPU's entire view of the
-world. Every fetch, read, and write goes through `b.Read()` and `b.Write()`
-(see walkthrough_bus.md Section 5).
+`cpu.NewCPU(b)` takes the bus as its only argument. The CPU does not know about RAM, ROM, or I/O directly -- the bus is the CPU's entire view of the world. Every fetch, read, and write goes through `b.Read()` and `b.Write()` (see walkthrough_bus.md Section 5).
 
-`c.Reset()` performs the 6502 reset sequence: it reads two bytes from
-`$FFFC`-`$FFFD` (65,532-65,533) through the bus, forming the 16-bit reset
-vector, and loads it into `PC`. Because the bus routes `$FFFC`-`$FFFD` to
-the ROM, this reads the ROM's first-boot entry point. For a standard Apple
-II+ 12 KB ROM, this is `$E000` (57,344) -- the beginning of the Autostart
-firmware (see walkthrough_cpu_go.md Section 5).
+`c.Reset()` performs the 6502 reset sequence: it reads two bytes from `$FFFC`-`$FFFD` (65,532-65,533) through the bus, forming the 16-bit reset vector, and loads it into `PC`. Because the bus routes `$FFFC`-`$FFFD` to the ROM, this reads the ROM's first-boot entry point. For a standard Apple II+ 12 KB ROM, this is `$E000` (57,344) -- the beginning of the Autostart firmware (see walkthrough_cpu_go.md Section 5).
 
-The `fmt.Printf` line prints the reset vector to stdout as a startup
-diagnostic. This is the only CPU-state output that Phase 4 preserves from
-Phase 3; the full per-instruction trace is gone.
+The `fmt.Printf` line prints the reset vector to stdout as a startup diagnostic. This is the only CPU-state output that Phase 4 preserves from Phase 3; the full per-instruction trace is gone.
 
 **Cross-references:**
 - walkthrough_cpu_go.md Section 5 (reset sequence, how PC is set from
@@ -691,23 +554,11 @@ $FFFC/$FFFD)
 vid := video.NewVideo(ram.Data[:])
 ```
 
-`ram.Data[:]` creates a Go slice from the RAM struct's internal
-`[65536]byte` array. The slice covers all 65,536 bytes of RAM.
-`video.NewVideo` stores this slice and later reads bytes from it during
-`RenderText()` (see walkthrough_video.md Section 3).
+`ram.Data[:]` creates a Go slice from the RAM struct's internal `[65536]byte` array. The slice covers all 65,536 bytes of RAM. `video.NewVideo` stores this slice and later reads bytes from it during `RenderText()` (see walkthrough_video.md Section 3).
 
-The important design point here is that the video renderer **bypasses the
-bus entirely**. It reads RAM directly rather than calling `b.Read()`. This
-is a deliberate coupling trade-off: at 40 characters per row, 24 rows, 60
-fps, reading the text page via the bus would require 40 x 24 x 60 = 57,600
-bus dispatches per second, each scanning a mapping slice. Direct RAM access
-avoids this overhead.
+The important design point here is that the video renderer **bypasses the bus entirely**. It reads RAM directly rather than calling `b.Read()`. This is a deliberate coupling trade-off: at 40 characters per row, 24 rows, 60 fps, reading the text page via the bus would require 40 x 24 x 60 = 57,600 bus dispatches per second, each scanning a mapping slice. Direct RAM access avoids this overhead.
 
-The trade-off is that the video renderer is tightly coupled to the RAM
-struct. This will need reworking if the emulator later implements bank
-switching (the language card), where the ROM region `$D000`-`$FFFF` can be
-remapped to RAM. See walkthrough_video.md Section 8 Q1 for a full discussion
-of this design decision.
+The trade-off is that the video renderer is tightly coupled to the RAM struct. This will need reworking if the emulator later implements bank switching (the language card), where the ROM region `$D000`-`$FFFF` can be remapped to RAM. See walkthrough_video.md Section 8 Q1 for a full discussion of this design decision.
 
 The `video` package was not present in Phase 3 at all.
 
@@ -721,14 +572,9 @@ argument)
 
 ### Sub-section 3e: SDL2 Initialization (lines 65-104)
 
-**What It Is**: Lines 65-104 initialize the SDL2 library and create the
-window, renderer, and texture that will display the emulated screen.
+**What It Is**: Lines 65-104 initialize the SDL2 library and create the window, renderer, and texture that will display the emulated screen.
 
-**How the Code Works**: SDL2 has a strict resource hierarchy: you must
-initialize the library before creating a window, create a window before
-creating a renderer, and create a renderer before creating a texture. The
-code follows this order, and Go's `defer` mechanism handles teardown in
-reverse order.
+**How the Code Works**: SDL2 has a strict resource hierarchy: you must initialize the library before creating a window, create a window before creating a renderer, and create a renderer before creating a texture. The code follows this order, and Go's `defer` mechanism handles teardown in reverse order.
 
 **Step 1 -- Library init (line 66)**:
 
@@ -736,11 +582,7 @@ reverse order.
 if err := sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS)); err != nil {
 ```
 
-`sdl.Init` initializes SDL subsystems. `sdl.INIT_VIDEO` activates the
-display subsystem; `sdl.INIT_EVENTS` activates the event queue (keyboard,
-mouse, quit). The bitwise OR combines them into a single flags word. The
-explicit `uint32(...)` casts on `INIT_VIDEO` and `INIT_EVENTS` are explained
-below.
+`sdl.Init` initializes SDL subsystems. `sdl.INIT_VIDEO` activates the display subsystem; `sdl.INIT_EVENTS` activates the event queue (keyboard, mouse, quit). The bitwise OR combines them into a single flags word. The explicit `uint32(...)` casts on `INIT_VIDEO` and `INIT_EVENTS` are explained below.
 
 **Step 2 -- Window (lines 72-81)**:
 
@@ -753,10 +595,7 @@ window, err := sdl.CreateWindow(
 )
 ```
 
-`sdl.WINDOWPOS_CENTERED` tells SDL to center the window on screen. `windowW`
-and `windowH` are 840 and 576 (declared in the `const` block).
-`sdl.WINDOW_SHOWN` makes the window visible immediately. `defer
-window.Destroy()` registers cleanup.
+`sdl.WINDOWPOS_CENTERED` tells SDL to center the window on screen. `windowW` and `windowH` are 840 and 576 (declared in the `const` block). `sdl.WINDOW_SHOWN` makes the window visible immediately. `defer window.Destroy()` registers cleanup.
 
 **Step 3 -- Renderer (lines 84-90)**:
 
@@ -765,12 +604,7 @@ renderer, err := sdl.CreateRenderer(window, -1,
     sdl.RENDERER_ACCELERATED|sdl.RENDERER_PRESENTVSYNC)
 ```
 
-The `-1` means "pick the best available rendering driver."
-`sdl.RENDERER_ACCELERATED` requests GPU-accelerated rendering.
-`sdl.RENDERER_PRESENTVSYNC` asks SDL to synchronize `renderer.Present()`
-with the display's vertical refresh signal -- this is the primary frame-rate
-limiter. These two constants appear bare (no explicit cast) and compile
-correctly on the current platform.
+The `-1` means "pick the best available rendering driver." `sdl.RENDERER_ACCELERATED` requests GPU-accelerated rendering. `sdl.RENDERER_PRESENTVSYNC` asks SDL to synchronize `renderer.Present()` with the display's vertical refresh signal -- this is the primary frame-rate limiter. These two constants appear bare (no explicit cast) and compile correctly on the current platform.
 
 **Step 4 -- Scaling hint (line 93)**:
 
@@ -778,10 +612,7 @@ correctly on the current platform.
 sdl.SetHint(sdl.HINT_RENDER_SCALE_QUALITY, "0")
 ```
 
-The string `"0"` selects nearest-neighbor (point) scaling. Without this
-hint, SDL defaults to bilinear interpolation, which blurs the 280x192 pixels
-when scaling up to 840x576. For pixel-art emulation, nearest-neighbor is
-always the right choice.
+The string `"0"` selects nearest-neighbor (point) scaling. Without this hint, SDL defaults to bilinear interpolation, which blurs the 280x192 pixels when scaling up to 840x576. For pixel-art emulation, nearest-neighbor is always the right choice.
 
 **Step 5 -- Texture (lines 95-103)**:
 
@@ -793,35 +624,13 @@ texture, err := renderer.CreateTexture(
 )
 ```
 
-The texture is `video.ScreenW` x `video.ScreenH` (280x192) pixels.
-`sdl.PIXELFORMAT_RGBA32` means each pixel is four bytes: red, green, blue,
-alpha. This matches the format that `video.RenderText()` writes into
-`vid.Pixels` (see walkthrough_video.md Section 2).
-`sdl.TEXTUREACCESS_STREAMING` tells SDL the texture will be updated every
-frame via `texture.Update()`, as opposed to a static texture or a render
-target.
+The texture is `video.ScreenW` x `video.ScreenH` (280x192) pixels. `sdl.PIXELFORMAT_RGBA32` means each pixel is four bytes: red, green, blue, alpha. This matches the format that `video.RenderText()` writes into `vid.Pixels` (see walkthrough_video.md Section 2). `sdl.TEXTUREACCESS_STREAMING` tells SDL the texture will be updated every frame via `texture.Update()`, as opposed to a static texture or a render target.
 
 #### CGo Constant Casting
 
-The explicit `uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66),
-and `PIXELFORMAT_RGBA32` (line 96) deserve explanation. The `go-sdl2`
-library wraps SDL's C header `#define` macros via CGo. In C, these macros
-are simply integer literals. When CGo imports them into Go, they appear as
-untyped constants with an internal CGo representation. When such a constant
-is passed to a Go function that expects a specific type (`uint32`, `int32`,
-etc.), Go's type system may refuse the implicit conversion.
+The explicit `uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66), and `PIXELFORMAT_RGBA32` (line 96) deserve explanation. The `go-sdl2` library wraps SDL's C header `#define` macros via CGo. In C, these macros are simply integer literals. When CGo imports them into Go, they appear as untyped constants with an internal CGo representation. When such a constant is passed to a Go function that expects a specific type (`uint32`, `int32`, etc.), Go's type system may refuse the implicit conversion.
 
-The safe pattern is: **when in doubt, cast**. The current code has explicit
-casts on `INIT_VIDEO`, `INIT_EVENTS`, and `PIXELFORMAT_RGBA32` because the
-function signatures for `sdl.Init` and `renderer.CreateTexture` require
-`uint32`. Other constants (`WINDOWPOS_CENTERED`, `WINDOW_SHOWN`,
-`RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`,
-`HINT_RENDER_SCALE_QUALITY`, `TEXTUREACCESS_STREAMING`) appear bare and
-compile correctly on the current platform (Go 1.21, darwin/arm64). Whether a
-bare CGo constant compiles depends on how Go's type checker resolves the
-expression and can vary across Go versions and platforms. If you encounter
-CGo compile errors with SDL constants on a different platform, adding an
-explicit cast is always the correct fix.
+The safe pattern is: **when in doubt, cast**. The current code has explicit casts on `INIT_VIDEO`, `INIT_EVENTS`, and `PIXELFORMAT_RGBA32` because the function signatures for `sdl.Init` and `renderer.CreateTexture` require `uint32`. Other constants (`WINDOWPOS_CENTERED`, `WINDOW_SHOWN`, `RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`, `HINT_RENDER_SCALE_QUALITY`, `TEXTUREACCESS_STREAMING`) appear bare and compile correctly on the current platform (Go 1.21, darwin/arm64). Whether a bare CGo constant compiles depends on how Go's type checker resolves the expression and can vary across Go versions and platforms. If you encounter CGo compile errors with SDL constants on a different platform, adding an explicit cast is always the correct fix.
 
 ### Diagram 3: SDL Resource Hierarchy and Defer Order
 
@@ -858,13 +667,7 @@ explicit cast is always the correct fix.
 
 ### Real-World Analogy
 
-Setting up a workshop. First you plug in the power strip (`sdl.Init`), then
-bolt the workbench to the floor (`CreateWindow`), then mount the lamp on the
-workbench (`CreateRenderer`), then place a canvas on the easel under the
-lamp (`CreateTexture`). When closing the shop, you take down the canvas
-first, then the lamp, then the bench, then unplug the power strip. Go's
-`defer` enforces this order automatically -- you declare the cleanup steps
-in the order you create resources, and Go reverses them at exit.
+Setting up a workshop. First you plug in the power strip (`sdl.Init`), then bolt the workbench to the floor (`CreateWindow`), then mount the lamp on the workbench (`CreateRenderer`), then place a canvas on the easel under the lamp (`CreateTexture`). When closing the shop, you take down the canvas first, then the lamp, then the bench, then unplug the power strip. Go's `defer` enforces this order automatically -- you declare the cleanup steps in the order you create resources, and Go reverses them at exit.
 
 **Cross-references:**
 - walkthrough_video.md Section 1 (`ScreenW`, `ScreenH` constants, used in
@@ -878,13 +681,9 @@ lands in sub-section 3f below)
 
 ### Sub-section 3f: The Main Loop (lines 108-168)
 
-**What It Is**: The 60fps game loop that runs from program start until the
-user quits.
+**What It Is**: The 60fps game loop that runs from program start until the user quits.
 
-**How the Code Works**: The loop variable `running` is initialized to `true`
-before the loop and set to `false` by quit events and the Escape key. The
-loop body has five numbered phases, each corresponding to one of the loop's
-comment headers.
+**How the Code Works**: The loop variable `running` is initialized to `true` before the loop and set to `false` by quit events and the Escape key. The loop body has five numbered phases, each corresponding to one of the loop's comment headers.
 
 **Phase 1 -- Event Polling (lines 117-137)**:
 
@@ -901,28 +700,13 @@ for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 }
 ```
 
-`sdl.PollEvent()` returns one event at a time and returns `nil` when the
-queue is empty. The `for` loop drains the entire event queue before
-advancing to the CPU step. This is important: if the queue were drained only
-one event at a time, rapid keystrokes could accumulate lag.
+`sdl.PollEvent()` returns one event at a time and returns `nil` when the queue is empty. The `for` loop drains the entire event queue before advancing to the CPU step. This is important: if the queue were drained only one event at a time, rapid keystrokes could accumulate lag.
 
-The type switch distinguishes `*sdl.QuitEvent` (window close button) from
-`*sdl.KeyboardEvent` (keyboard). Only `sdl.KEYDOWN` events are processed --
-the Apple II keyboard has no key-release concept, so `KEYUP` events are
-ignored.
+The type switch distinguishes `*sdl.QuitEvent` (window close button) from `*sdl.KeyboardEvent` (keyboard). Only `sdl.KEYDOWN` events are processed -- the Apple II keyboard has no key-release concept, so `KEYUP` events are ignored.
 
-For keyboard events: `sdlKeyToApple(e)` (detailed in Section 4) translates
-the SDL keycode to an Apple II key code. A return value of 0 means "no Apple
-II equivalent, discard." If the key maps to a valid code, `sw.PressKey(key)`
-delivers it to the softswitch layer, which stores it in the keyboard latch
-register at `$C000` (49,152) and sets the strobe bit at `$C010` (49,168)
-(see walkthrough_io.md Section 5). The running Apple II firmware polls
-`$C000` in its keyboard-input loop and consumes the keypress.
+For keyboard events: `sdlKeyToApple(e)` (detailed in Section 4) translates the SDL keycode to an Apple II key code. A return value of 0 means "no Apple II equivalent, discard." If the key maps to a valid code, `sw.PressKey(key)` delivers it to the softswitch layer, which stores it in the keyboard latch register at `$C000` (49,152) and sets the strobe bit at `$C010` (49,168) (see walkthrough_io.md Section 5). The running Apple II firmware polls `$C000` in its keyboard-input loop and consumes the keypress.
 
-Escape and Ctrl+R are handled after `sdlKeyToApple` for two reasons: Escape
-has an SDL keycode (`sdl.K_ESCAPE`) but is handled as a quit rather than
-being sent to the Apple II; Ctrl+R calls `c.Reset()` directly rather than
-sending a control character to the Apple II keyboard.
+Escape and Ctrl+R are handled after `sdlKeyToApple` for two reasons: Escape has an SDL keycode (`sdl.K_ESCAPE`) but is handled as a quit rather than being sent to the Apple II; Ctrl+R calls `c.Reset()` directly rather than sending a control character to the Apple II keyboard.
 
 **Phase 2 -- CPU Execution (lines 139-142)**:
 
@@ -932,17 +716,9 @@ for cycles := 0; cycles < cyclesPerFrame; {
 }
 ```
 
-This loop executes CPU instructions until the frame's cycle budget
-(`cyclesPerFrame = 17,050`) is consumed. `c.Step()` fetches, decodes, and
-executes one instruction and returns the number of cycles it took (see
-walkthrough_cpu_go.md Section 6). The loop may overshoot the budget
-slightly: if 17,047 cycles have been consumed and the next instruction takes
-6 cycles, the total becomes 17,053. This two-to-six cycle overshoot per
-frame is standard for emulators -- it is far smaller than the measurement
-noise in SDL's vsync timing.
+This loop executes CPU instructions until the frame's cycle budget (`cyclesPerFrame = 17,050`) is consumed. `c.Step()` fetches, decodes, and executes one instruction and returns the number of cycles it took (see walkthrough_cpu_go.md Section 6). The loop may overshoot the budget slightly: if 17,047 cycles have been consumed and the next instruction takes 6 cycles, the total becomes 17,053. This two-to-six cycle overshoot per frame is standard for emulators -- it is far smaller than the measurement noise in SDL's vsync timing.
 
-Phase 4 does not include stuck-loop detection or trace output. It trusts the
-CPU. An unimplemented opcode will still cause a Go panic (see Section 7 Q6).
+Phase 4 does not include stuck-loop detection or trace output. It trusts the CPU. An unimplemented opcode will still cause a Go panic (see Section 7 Q6).
 
 **Phase 3 -- Render (line 145)**:
 
@@ -950,22 +726,9 @@ CPU. An unimplemented opcode will still cause a Go panic (see Section 7 Q6).
 vid.RenderText()
 ```
 
-One function call fills the entire 215,040-byte pixel buffer (`vid.Pixels`)
-by reading the 960 text-page bytes from RAM, looking up each character in
-the character generator, and writing RGBA32 pixels. For the internals of
-this call -- the triple-nested loop, `textLineAddr`, flash timer, and
-character encoding -- see walkthrough_video.md Section 6. This walkthrough
-does not repeat that explanation.
+One function call fills the entire 215,040-byte pixel buffer (`vid.Pixels`) by reading the 960 text-page bytes from RAM, looking up each character in the character generator, and writing RGBA32 pixels. For the internals of this call -- the triple-nested loop, `textLineAddr`, flash timer, and character encoding -- see walkthrough_video.md Section 6. This walkthrough does not repeat that explanation.
 
-Note on Phase 4's open forward pointer: the io walkthrough
-(walkthrough_io.md Section 6, Step 7) says "the video renderer will consult
-`TextMode` and `HiRes` on every frame to decide how to draw the screen."
-That is still unresolved: Phase 4 calls `vid.RenderText()` unconditionally
-on every frame, regardless of the softswitch state. The `TextMode` and
-`HiRes` softswitches exist and are tracked by the `SoftSwitches` struct, but
-the video renderer does not read them yet. A future phase will add a
-`vid.Render(sw)` call that checks these switches and dispatches to the
-appropriate renderer.
+Note on Phase 4's open forward pointer: the io walkthrough (walkthrough_io.md Section 6, Step 7) says "the video renderer will consult `TextMode` and `HiRes` on every frame to decide how to draw the screen." That is still unresolved: Phase 4 calls `vid.RenderText()` unconditionally on every frame, regardless of the softswitch state. The `TextMode` and `HiRes` softswitches exist and are tracked by the `SoftSwitches` struct, but the video renderer does not read them yet. A future phase will add a `vid.Render(sw)` call that checks these switches and dispatches to the appropriate renderer.
 
 **Phase 4 -- SDL Present (lines 147-151)**:
 
@@ -976,23 +739,16 @@ renderer.Copy(texture, nil, nil)
 renderer.Present()
 ```
 
-`texture.Update` copies the pixel buffer from Go memory to GPU memory. The
-three arguments are:
+`texture.Update` copies the pixel buffer from Go memory to GPU memory. The three arguments are:
 - `nil` -- update the entire texture (no sub-rectangle)
 - `unsafe.Pointer(&vid.Pixels[0])` -- a raw pointer to the first byte of the
 Go slice; this is how Go data crosses the CGo boundary into SDL's C layer
 - `int(video.ScreenW)*4` = 280 x 4 = 1,120 -- the "pitch" (bytes per row);
 SDL uses this to advance from one row to the next within the pixel buffer
 
-`renderer.Clear()` fills the renderer's back buffer with the current draw
-color (default black). `renderer.Copy(texture, nil, nil)` copies the 280x192
-texture onto the back buffer; the first `nil` means "copy the entire
-texture," and the second `nil` means "stretch to fill the entire renderer"
--- this is where the 280x192 source becomes the 840x576 display.
-`renderer.Present()` swaps the back buffer to the screen.
+`renderer.Clear()` fills the renderer's back buffer with the current draw color (default black). `renderer.Copy(texture, nil, nil)` copies the 280x192 texture onto the back buffer; the first `nil` means "copy the entire texture," and the second `nil` means "stretch to fill the entire renderer" -- this is where the 280x192 source becomes the 840x576 display. `renderer.Present()` swaps the back buffer to the screen.
 
-For a detailed explanation of `texture.Update` and the pitch calculation,
-see walkthrough_video.md Section 7 "The SDL Upload Step."
+For a detailed explanation of `texture.Update` and the pitch calculation, see walkthrough_video.md Section 7 "The SDL Upload Step."
 
 **Phase 5 -- Frame Timing (lines 153-167)**:
 
@@ -1011,18 +767,9 @@ if elapsed < target {
 }
 ```
 
-The FPS counter increments `frameCount` each frame and writes the count to
-the window title bar once per second, then resets the counter. This gives a
-live "N fps" display in the title bar.
+The FPS counter increments `frameCount` each frame and writes the count to the window title bar once per second, then resets the counter. This gives a live "N fps" display in the title bar.
 
-The vsync fallback uses `time.Since(frameStart)` to measure how long the
-frame took. If it finished in less than `target` (16.67ms), `sdl.Delay()`
-sleeps for the remaining time. This is a safety net: if
-`RENDERER_PRESENTVSYNC` is working correctly, `renderer.Present()` already
-blocked for the remaining time. If vsync is broken (headless environment,
-certain virtual machines), the manual delay prevents the loop from spinning
-at thousands of frames per second. `sdl.Delay` takes `uint32` milliseconds
--- another CGo-style cast from `time.Duration` via `.Milliseconds()`.
+The vsync fallback uses `time.Since(frameStart)` to measure how long the frame took. If it finished in less than `target` (16.67ms), `sdl.Delay()` sleeps for the remaining time. This is a safety net: if `RENDERER_PRESENTVSYNC` is working correctly, `renderer.Present()` already blocked for the remaining time. If vsync is broken (headless environment, certain virtual machines), the manual delay prevents the loop from spinning at thousands of frames per second. `sdl.Delay` takes `uint32` milliseconds -- another CGo-style cast from `time.Duration` via `.Milliseconds()`.
 
 ### Diagram 5: Main Loop Anatomy
 
@@ -1065,13 +812,7 @@ at thousands of frames per second. `sdl.Delay` takes `uint32` milliseconds
 
 ### Real-World Analogy
 
-A movie theater projection loop. (1) Check if any audience member pressed
-the exit button. (2) Film 17,050 micro-actions for the next frame. (3)
-Develop the film frame in the darkroom. (4) Project it onto the screen. (5)
-Wait until 1/60th of a second has passed before starting the next frame. If
-the projector has built-in sync (vsync), it handles the wait automatically;
-otherwise the projectionist manually counts down. Either way, the screen
-updates exactly 60 times per second.
+A movie theater projection loop. (1) Check if any audience member pressed the exit button. (2) Film 17,050 micro-actions for the next frame. (3) Develop the film frame in the darkroom. (4) Project it onto the screen. (5) Wait until 1/60th of a second has passed before starting the next frame. If the projector has built-in sync (vsync), it handles the wait automatically; otherwise the projectionist manually counts down. Either way, the screen updates exactly 60 times per second.
 
 **Cross-references:**
 - walkthrough_io.md Section 5 (PressKey -- how key codes reach the Apple II)
@@ -1087,24 +828,15 @@ explanation)
 
 ### What It Is
 
-`sdlKeyToApple` (function signature at line 172, closing brace at line 266)
-converts an SDL `KeyboardEvent` into an Apple II key code byte. It returns 0
-for keys that have no Apple II equivalent.
+`sdlKeyToApple` (function signature at line 172, closing brace at line 266) converts an SDL `KeyboardEvent` into an Apple II key code byte. It returns 0 for keys that have no Apple II equivalent.
 
 ### Why It Matters
 
-The Apple II keyboard is radically different from a modern keyboard. It is
-uppercase-only and has no concept of key release. Its arrow keys produce
-control codes (`$08`, `$0B`, `$0A`, `$15`), not separate "cursor" events.
-Its shift key produces a specific set of shifted characters that do not
-exactly match a modern US keyboard layout. This function is the translation
-layer between two keyboard worlds separated by nearly 50 years of hardware
-evolution.
+The Apple II keyboard is radically different from a modern keyboard. It is uppercase-only and has no concept of key release. Its arrow keys produce control codes (`$08`, `$0B`, `$0A`, `$15`), not separate "cursor" events. Its shift key produces a specific set of shifted characters that do not exactly match a modern US keyboard layout. This function is the translation layer between two keyboard worlds separated by nearly 50 years of hardware evolution.
 
 ### How the Code Works
 
-The function has three code blocks, each handling a different category of
-input.
+The function has three code blocks, each handling a different category of input.
 
 **Block 1 -- Control key combinations (lines 177-181)**:
 
@@ -1116,13 +848,7 @@ if mod&sdl.KMOD_CTRL != 0 {
 }
 ```
 
-When the Control modifier is held, letters A through Z map to ASCII control
-characters 1 through 26. The arithmetic: `sym - sdl.K_a` produces 0 for A, 1
-for B, ..., 25 for Z. Adding 1 shifts the range to 1-26, matching the ASCII
-control character block (`Ctrl+A` = SOH = 1, `Ctrl+B` = STX = 2, ...,
-`Ctrl+Z` = SUB = 26). These are the control codes the Apple II ROM uses for
-terminal control: `Ctrl+H` is backspace, `Ctrl+M` is return, `Ctrl+G` is
-bell, etc.
+When the Control modifier is held, letters A through Z map to ASCII control characters 1 through 26. The arithmetic: `sym - sdl.K_a` produces 0 for A, 1 for B, ..., 25 for Z. Adding 1 shifts the range to 1-26, matching the ASCII control character block (`Ctrl+A` = SOH = 1, `Ctrl+B` = STX = 2, ..., `Ctrl+Z` = SUB = 26). These are the control codes the Apple II ROM uses for terminal control: `Ctrl+H` is backspace, `Ctrl+M` is return, `Ctrl+G` is bell, etc.
 
 **Block 2 -- Special keys (lines 184-201)**:
 
@@ -1132,8 +858,7 @@ A `switch` statement maps named keys to their Apple II equivalents:
 - Backspace: `$08` (8) -- same as the left arrow on the Apple II
 - Delete: `$7F` (127) -- the "rubout" character
 - Left arrow: `$08` (8) -- the Apple II left arrow IS backspace; the
-keyboard had a single key labeled `<--` (delete/backspace) rather than
-separate left-arrow and backspace keys
+keyboard had a single key labeled `<--` (delete/backspace) rather than separate left-arrow and backspace keys
 - Right arrow: `$15` (21) -- this is `Ctrl+U` in ASCII, which the Apple II
 ROM uses for cursor right
 - Up arrow: `$0B` (11) -- `Ctrl+K`, vertical tab
@@ -1142,22 +867,11 @@ ROM uses for cursor right
 
 **Block 3 -- Printable ASCII (lines 203-263)**:
 
-For characters in the printable ASCII range (codes 32-126), the function
-applies two transformations. If Shift is held, lowercase letters are
-uppercased (`ch -= 32`), and number/punctuation keys are mapped to their
-shifted symbols via a manual lookup table (e.g., `'1'` becomes `'!'`, `'2'`
-becomes `'@'`, etc.). If Shift is not held, the Apple II's uppercase-only
-nature is enforced by auto-converting any lowercase letter to uppercase.
+For characters in the printable ASCII range (codes 32-126), the function applies two transformations. If Shift is held, lowercase letters are uppercased (`ch -= 32`), and number/punctuation keys are mapped to their shifted symbols via a manual lookup table (e.g., `'1'` becomes `'!'`, `'2'` becomes `'@'`, etc.). If Shift is not held, the Apple II's uppercase-only nature is enforced by auto-converting any lowercase letter to uppercase.
 
-**Known limitation**: The shift table maps `[` to `{`, `]` to `}`, `\` to
-`|`, and backtick to `~`. These characters (`{`, `}`, `|`, `~`) do not exist
-on the Apple II+ keyboard and their character codes (`$7B`, `$7D`, `$7C`,
-`$7E`) are not defined in the Apple II character ROM. If these codes reach
-the Apple II, the ROM will display unexpected characters or garbage. This is
-a known issue.
+**Known limitation**: The shift table maps `[` to `{`, `]` to `}`, `\` to `|`, and backtick to `~`. These characters (`{`, `}`, `|`, `~`) do not exist on the Apple II+ keyboard and their character codes (`$7B`, `$7D`, `$7C`, `$7E`) are not defined in the Apple II character ROM. If these codes reach the Apple II, the ROM will display unexpected characters or garbage. This is a known issue.
 
-For the character encoding zones (`$00`-`$3F`, `$40`-`$7F`, `$80`-`$FF`)
-that Apple II key codes must fall into, see walkthrough_chargen.md Section
+For the character encoding zones (`$00`-`$3F`, `$40`-`$7F`, `$80`-`$FF`) that Apple II key codes must fall into, see walkthrough_chargen.md Section
 3.
 
 ### Diagram 7: Apple II Keyboard Code Map
@@ -1183,14 +897,7 @@ that Apple II key codes must fall into, see walkthrough_chargen.md Section
 
 ### Real-World Analogy
 
-A diplomatic interpreter who translates between two very different languages
--- and also edits the message as they translate. Lowercase words are
-converted to uppercase (the Apple II does not understand lowercase). Arrow
-keys become control-code sequences (the Apple II's native directional
-vocabulary). Keys with no Apple II equivalent are dropped entirely (return
-value 0: "I cannot translate this"). And a few mistranslations slip through
-(the symbols `{`, `}`, `|`, `~`) because the interpreter was trained on a
-slightly wrong glossary.
+A diplomatic interpreter who translates between two very different languages -- and also edits the message as they translate. Lowercase words are converted to uppercase (the Apple II does not understand lowercase). Arrow keys become control-code sequences (the Apple II's native directional vocabulary). Keys with no Apple II equivalent are dropped entirely (return value 0: "I cannot translate this"). And a few mistranslations slip through (the symbols `{`, `}`, `|`, `~`) because the interpreter was trained on a slightly wrong glossary.
 
 **Cross-references:**
 - walkthrough_io.md Section 3b (keyboard registers `$C000`/`$C010`, strobe
@@ -1205,35 +912,23 @@ key codes must land in)
 
 ### What It Is
 
-`loadROM` (lines 268-287) is a helper function that reads a ROM file from
-disk and determines the correct base address from the file size. It returns
-a `*memory.ROM` ready to be mapped onto the bus.
+`loadROM` (lines 268-287) is a helper function that reads a ROM file from disk and determines the correct base address from the file size. It returns a `*memory.ROM` ready to be mapped onto the bus.
 
 ### Why It Matters
 
-The Apple II+ ROM is 12 KB, mapped at `$D000`-`$FFFF` (53,248-65,535). Many
-ROM dumps available online are 16 KB, covering `$C000`-`$FFFF`
-(49,152-65,535) and including the slot ROM area. A user should not need to
-know which format they have -- the emulator detects it automatically.
+The Apple II+ ROM is 12 KB, mapped at `$D000`-`$FFFF` (53,248-65,535). Many ROM dumps available online are 16 KB, covering `$C000`-`$FFFF` (49,152-65,535) and including the slot ROM area. A user should not need to know which format they have -- the emulator detects it automatically.
 
 ### How the Code Works
 
-The function calls `os.Stat(path)` to get the file size without opening the
-file. Then a `switch` on the size selects the base address:
+The function calls `os.Stat(path)` to get the file size without opening the file. Then a `switch` on the size selects the base address:
 
 - 12,288 bytes (12 KB): base = `$D000` (53,248)
 - 16,384 bytes (16 KB): base = `$C000` (49,152)
 - Any other size between 1 and 12,288 bytes: base = `0x10000 - size`,
-placing the ROM at the top of the 64 KB address space regardless of exact
-length
+placing the ROM at the top of the 64 KB address space regardless of exact length
 - Any other size: return a descriptive error
 
-The function body is essentially identical to Phase 3's `loadROM`. The only
-difference is the error message: Phase 4 removes the multi-line "Common ROM
-sizes" help text that appeared in Phase 3's error output. For the full
-explanation of the size logic, ROM overlap mechanics, and the
-`memory.LoadROM` / `ROM.Base` / `ROM.End()` internals, see
-walkthrough_main_phase3.md Section 3 and walkthrough_memory.md Section 3.
+The function body is essentially identical to Phase 3's `loadROM`. The only difference is the error message: Phase 4 removes the multi-line "Common ROM sizes" help text that appeared in Phase 3's error output. For the full explanation of the size logic, ROM overlap mechanics, and the `memory.LoadROM` / `ROM.Base` / `ROM.End()` internals, see walkthrough_main_phase3.md Section 3 and walkthrough_memory.md Section 3.
 
 **Cross-references:**
 - walkthrough_main_phase3.md Section 3 (full loadROM explanation, error
@@ -1245,8 +940,7 @@ End() method)
 
 ## Section 6: Putting It Together -- The Phase 4 Boot and Run Flow
 
-Reading `main.go` linearly is straightforward, but it helps to see the full
-sequence as a timeline to understand why the order matters.
+Reading `main.go` linearly is straightforward, but it helps to see the full sequence as a timeline to understand why the order matters.
 
 ### Diagram 8: Phase 4 Boot Timeline
 
@@ -1277,8 +971,7 @@ call `b.Map`).
 - The bus must be wired before the CPU is created (the CPU takes the bus as
 a constructor argument).
 - The CPU must be created before `Reset()` is called (obvious, but
-`c.Reset()` reads through the bus, so the ROM must also be on the bus
-already).
+`c.Reset()` reads through the bus, so the ROM must also be on the bus already).
 - The video renderer must be created after RAM (it holds a reference to
 `ram.Data[:]`), but it does not need the bus, CPU, or SDL to exist yet.
 - SDL must be initialized before creating any SDL resources (window,
@@ -1288,8 +981,7 @@ any step fails, the program exits before entering the loop.
 
 ### Forward Pointer Roundup
 
-Every walkthrough in the series ended with forward pointers that said "this
-will matter when main.go wires it together." Here is where each one lands:
+Every walkthrough in the series ended with forward pointers that said "this will matter when main.go wires it together." Here is where each one lands:
 
 | Source Walkthrough | Forward Pointer | Where It Lands in Phase 4 |
 |---|---|---|
@@ -1302,24 +994,12 @@ will matter when main.go wires it together." Here is where each one lands:
 | walkthrough_chargen.md Section 7 | "Forward pointer to walkthrough_video.md" | Closed by walkthrough_video.md, not main |
 | walkthrough_memory.md Section 6 | "Forward reference to bus walkthrough" | Closed by walkthrough_bus.md, not main |
 
-**The open forward pointer**: The io walkthrough (walkthrough_io.md Section
-6, Step 7) says: "the video renderer (not yet in this codebase) will consult
-`TextMode` and `HiRes` on every frame to decide how to draw the screen." Two
-things to note:
+**The open forward pointer**: The io walkthrough (walkthrough_io.md Section 6, Step 7) says: "the video renderer (not yet in this codebase) will consult `TextMode` and `HiRes` on every frame to decide how to draw the screen." Two things to note:
 
-1. The aside "(not yet in this codebase)" is now stale -- the `video`
-package exists in Phase 4.
-2. The substance of the forward pointer is still unresolved. Phase 4 calls
-`vid.RenderText()` unconditionally on every frame. The `TextMode` and
-`HiRes` softswitches are tracked by the `SoftSwitches` struct, but the video
-renderer does not read them. This forward pointer will be closed in a future
-phase when the video renderer gains a `Render(sw)` signature that dispatches
-to text, lo-res, or hi-res rendering based on softswitch state.
+1. The aside "(not yet in this codebase)" is now stale -- the `video` package exists in Phase 4.
+2. The substance of the forward pointer is still unresolved. Phase 4 calls `vid.RenderText()` unconditionally on every frame. The `TextMode` and `HiRes` softswitches are tracked by the `SoftSwitches` struct, but the video renderer does not read them. This forward pointer will be closed in a future phase when the video renderer gains a `Render(sw)` signature that dispatches to text, lo-res, or hi-res rendering based on softswitch state.
 
-Note for readers of walkthrough_video.md: Section 7 of that walkthrough
-references "walkthrough_main_phase3.md Section 2" for the SDL window setup.
-That reference is now superseded. The SDL setup is in Sub-section 3e of this
-walkthrough (`walkthrough_main.md`).
+Note for readers of walkthrough_video.md: Section 7 of that walkthrough references "walkthrough_main_phase3.md Section 2" for the SDL window setup. That reference is now superseded. The SDL setup is in Sub-section 3e of this walkthrough (`walkthrough_main.md`).
 
 ---
 
@@ -1327,110 +1007,43 @@ walkthrough (`walkthrough_main.md`).
 
 **Q1: Why does the video renderer bypass the bus and read RAM directly?**
 
-Two reasons. First, performance: the text page is 960 bytes (40 columns x 24
-rows), and rendering it at 60 fps would require 57,600 bus read dispatches
-per second. Each dispatch scans a mapping slice, which is fast but not free.
-Direct RAM access eliminates the overhead. Second, correctness: text page 1
-at `$0400`-`$07FF` (1,024-2,047) is always in unbanked RAM for an Apple II+
--- there is no configuration where this region is remapped to something
-else.
+Two reasons. First, performance: the text page is 960 bytes (40 columns x 24 rows), and rendering it at 60 fps would require 57,600 bus read dispatches per second. Each dispatch scans a mapping slice, which is fast but not free. Direct RAM access eliminates the overhead. Second, correctness: text page 1 at `$0400`-`$07FF` (1,024-2,047) is always in unbanked RAM for an Apple II+ -- there is no configuration where this region is remapped to something else.
 
-The trade-off is tight coupling between the video renderer and the
-`memory.RAM` struct. When the emulator later implements bank switching (the
-language card), the video renderer will need to be updated to understand
-which 64 KB "view" of RAM is active. For a full discussion, see
-walkthrough_video.md Section 8 Q1.
+The trade-off is tight coupling between the video renderer and the `memory.RAM` struct. When the emulator later implements bank switching (the language card), the video renderer will need to be updated to understand which 64 KB "view" of RAM is active. For a full discussion, see walkthrough_video.md Section 8 Q1.
 
 **Q2: Why are some CGo constants explicitly cast and others are not?**
 
-The `go-sdl2` library wraps C `#define` macros via CGo. When passed to Go
-functions that require explicit types (`uint32`, `int32`), these constants
-may fail to compile without a cast. The current code has explicit
-`uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66), and
-`PIXELFORMAT_RGBA32` (line 96). Other SDL constants (`WINDOWPOS_CENTERED`,
-`WINDOW_SHOWN`, `RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`,
-`TEXTUREACCESS_STREAMING`, and all the `K_*` keycodes and `KMOD_*`
-modifiers) appear bare and compile on the current platform (Go 1.21,
-darwin/arm64).
+The `go-sdl2` library wraps C `#define` macros via CGo. When passed to Go functions that require explicit types (`uint32`, `int32`), these constants may fail to compile without a cast. The current code has explicit `uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66), and `PIXELFORMAT_RGBA32` (line 96). Other SDL constants (`WINDOWPOS_CENTERED`, `WINDOW_SHOWN`, `RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`, `TEXTUREACCESS_STREAMING`, and all the `K_*` keycodes and `KMOD_*` modifiers) appear bare and compile on the current platform (Go 1.21, darwin/arm64).
 
-Whether a bare CGo constant compiles depends on the context in which it is
-used and can vary across Go versions and platforms. The safest practice is
-to always wrap SDL constants in an explicit cast matching the target type.
-The rule is: **when in doubt, cast**.
+Whether a bare CGo constant compiles depends on the context in which it is used and can vary across Go versions and platforms. The safest practice is to always wrap SDL constants in an explicit cast matching the target type. The rule is: **when in doubt, cast**.
 
 **Q3: Why is the main loop single-threaded instead of using goroutines?**
 
-SDL2 is not thread-safe; all SDL calls must happen on the main OS thread. On
-macOS, this is enforced by the OS itself -- SDL's window creation will fail
-or crash if called from a non-main thread. Even on platforms where SDL is
-more lenient, a single-threaded game loop is the standard SDL2 pattern.
-Goroutines would require synchronization channels for every SDL call, adding
-complexity with no benefit: the bottleneck is the 16.67ms frame budget, not
-Go's scheduler.
+SDL2 is not thread-safe; all SDL calls must happen on the main OS thread. On macOS, this is enforced by the OS itself -- SDL's window creation will fail or crash if called from a non-main thread. Even on platforms where SDL is more lenient, a single-threaded game loop is the standard SDL2 pattern. Goroutines would require synchronization channels for every SDL call, adding complexity with no benefit: the bottleneck is the 16.67ms frame budget, not Go's scheduler.
 
 **Q4: Why use `sdl.Delay()` as the vsync fallback instead of `time.Sleep()`?**
 
-`sdl.Delay()` is SDL's own timing function, designed to cooperate with its
-event system and be accurate on all SDL-supported platforms. `time.Sleep()`
-would likely work in practice on most systems, but `sdl.Delay()` is the
-idiomatic choice for SDL applications and avoids any potential interaction
-between Go's goroutine scheduler and SDL's internal timing on exotic
-platforms. The primary timing mechanism is vsync via
-`RENDERER_PRESENTVSYNC`; the manual delay is only a safety net for
-environments where vsync is unavailable or broken.
+`sdl.Delay()` is SDL's own timing function, designed to cooperate with its event system and be accurate on all SDL-supported platforms. `time.Sleep()` would likely work in practice on most systems, but `sdl.Delay()` is the idiomatic choice for SDL applications and avoids any potential interaction between Go's goroutine scheduler and SDL's internal timing on exotic platforms. The primary timing mechanism is vsync via `RENDERER_PRESENTVSYNC`; the manual delay is only a safety net for environments where vsync is unavailable or broken.
 
-**Q5: Why does `sdlKeyToApple` generate shifted symbols that do not exist on
-the Apple II?**
+**Q5: Why does `sdlKeyToApple` generate shifted symbols that do not exist on the Apple II?**
 
-The shift table maps `[` to `{`, `]` to `}`, `\` to `|`, and backtick to
-`~`. These characters are not present on the Apple II+ keyboard and their
-character ROM entries produce unexpected glyphs. This is a known issue (no
-`{` key on an Apple II+ means there is no legitimate way to input this
-code). A clean fix would be to not generate these codes, or to filter out
-any key code above `$5F` (95) that does not correspond to a valid Apple II
-character. The current code is permissive and simply passes these codes
-through to the softswitch layer.
+The shift table maps `[` to `{`, `]` to `}`, `\` to `|`, and backtick to `~`. These characters are not present on the Apple II+ keyboard and their character ROM entries produce unexpected glyphs. This is a known issue (no `{` key on an Apple II+ means there is no legitimate way to input this code). A clean fix would be to not generate these codes, or to filter out any key code above `$5F` (95) that does not correspond to a valid Apple II character. The current code is permissive and simply passes these codes through to the softswitch layer.
 
 **Q6: Why is there no error recovery for CPU panics?**
 
-If the CPU encounters an opcode that is not yet implemented, `c.Step()` will
-call `panic()`, crashing the emulator with a Go stack trace. Phase 4 does
-not wrap the CPU step loop in a `recover()` block. This is an intentional
-development trade-off: a crash with a full stack trace identifies the
-unimplemented opcode immediately, while silent failure or a black screen
-would be harder to debug. A future phase could add a `defer recover()` block
-that catches CPU panics and displays an on-screen error message.
+If the CPU encounters an opcode that is not yet implemented, `c.Step()` will call `panic()`, crashing the emulator with a Go stack trace. Phase 4 does not wrap the CPU step loop in a `recover()` block. This is an intentional development trade-off: a crash with a full stack trace identifies the unimplemented opcode immediately, while silent failure or a black screen would be harder to debug. A future phase could add a `defer recover()` block that catches CPU panics and displays an on-screen error message.
 
 **Q7: Why does `RenderText()` re-render the entire screen every frame?**
 
-Dirty-rectangle tracking -- only re-rendering the cells whose underlying
-text bytes changed -- would reduce GPU load but would add considerable
-complexity: the video renderer would need to compare the current text page
-against a cached copy on every frame. At 280x192 pixels with 4 bytes per
-pixel, the total pixel buffer is 215,040 bytes, and copying that to the GPU
-via `texture.Update` is trivial on modern hardware. The simplicity of always
-rendering everything outweighs the minimal performance savings of dirty
-tracking. See walkthrough_video.md Section 8 Q7 for a fuller discussion.
+Dirty-rectangle tracking -- only re-rendering the cells whose underlying text bytes changed -- would reduce GPU load but would add considerable complexity: the video renderer would need to compare the current text page against a cached copy on every frame. At 280x192 pixels with 4 bytes per pixel, the total pixel buffer is 215,040 bytes, and copying that to the GPU via `texture.Update` is trivial on modern hardware. The simplicity of always rendering everything outweighs the minimal performance savings of dirty tracking. See walkthrough_video.md Section 8 Q7 for a fuller discussion.
 
 ---
 
 ## Section 8: Summary and What Is Next
 
-`main.go` is 287 lines that assemble a working Apple II emulator from six
-packages. It loads a ROM file, maps three devices onto an address bus,
-creates a 6502 CPU and boots it from the ROM's reset vector, initializes an
-SDL2 window with a 280x192 streaming texture, and enters a 60fps loop that
-polls keyboard events, executes 17,050 CPU cycles per frame, renders the
-Apple II text screen into an RGBA32 pixel buffer, and presents that buffer
-to the display. Every line has a clear purpose. Every package has a single
-responsibility.
+`main.go` is 287 lines that assemble a working Apple II emulator from six packages. It loads a ROM file, maps three devices onto an address bus, creates a 6502 CPU and boots it from the ROM's reset vector, initializes an SDL2 window with a 280x192 streaming texture, and enters a 60fps loop that polls keyboard events, executes 17,050 CPU cycles per frame, renders the Apple II text screen into an RGBA32 pixel buffer, and presents that buffer to the display. Every line has a clear purpose. Every package has a single responsibility.
 
-> **Take-home idea**: `main.go` is a wiring diagram, not an algorithm. Its
-> job is to instantiate components (RAM, ROM, bus, CPU, I/O, video, SDL) and
-> connect them in the right order. The main loop is a five-phase pipeline
-> (poll, execute, render, present, wait) that repeats 60 times per second.
-> The emulator's intelligence lives in the packages; `main.go` just starts
-> the machine and turns the crank.
+> **Take-home idea**: `main.go` is a wiring diagram, not an algorithm. Its job is to instantiate components (RAM, ROM, bus, CPU, I/O, video, SDL) and connect them in the right order. The main loop is a five-phase pipeline (poll, execute, render, present, wait) that repeats 60 times per second. The emulator's intelligence lives in the packages; `main.go` just starts the machine and turns the crank.
 
 ### Quick Reference
 
@@ -1457,20 +1070,10 @@ responsibility.
 
 ### What Is Next
 
-The walkthrough series is complete for the current codebase. The natural
-next areas of development are:
+The walkthrough series is complete for the current codebase. The natural next areas of development are:
 
-- **Lo-res graphics (GR)** -- reinterpret the `$0400`-`$07FF` text page
-  bytes as 40x48 color blocks when the `TEXT` softswitch is off and `HIRES`
-  is off.
-- **Hi-res graphics (HGR)** -- a new renderer that reads the `$2000`-`$3FFF`
-  (8,192-16,383) bitmap area and maps each byte to seven horizontal pixels
-  using the Apple II's peculiar color encoding.
-- **Audio output** -- sample the speaker-toggle softswitch at `$C030`
-  (49,200) and convert state changes into a PCM waveform sent to SDL's audio
-  subsystem.
-- **Disk II** -- implement slot 6 I/O to load software from `.dsk` or `.woz`
-  disk images, enabling the emulator to run the Apple II software library.
-- **Bank switching / language card** -- allow the ROM region `$D000`-`$FFFF`
-  (53,248-65,535) to be remapped to writable RAM, enabling Applesoft BASIC
-  to be replaced with Integer BASIC and enabling 64 KB of accessible RAM.
+- **Lo-res graphics (GR)** -- reinterpret the `$0400`-`$07FF` text page bytes as 40x48 color blocks when the `TEXT` softswitch is off and `HIRES` is off.
+- **Hi-res graphics (HGR)** -- a new renderer that reads the `$2000`-`$3FFF` (8,192-16,383) bitmap area and maps each byte to seven horizontal pixels using the Apple II's peculiar color encoding.
+- **Audio output** -- sample the speaker-toggle softswitch at `$C030` (49,200) and convert state changes into a PCM waveform sent to SDL's audio subsystem.
+- **Disk II** -- implement slot 6 I/O to load software from `.dsk` or `.woz` disk images, enabling the emulator to run the Apple II software library.
+- **Bank switching / language card** -- allow the ROM region `$D000`-`$FFFF` (53,248-65,535) to be remapped to writable RAM, enabling Applesoft BASIC to be replaced with Integer BASIC and enabling 64 KB of accessible RAM.
