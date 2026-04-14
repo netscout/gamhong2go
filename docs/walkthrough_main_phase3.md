@@ -1,0 +1,1083 @@
+# Educational Walkthrough: `main.go` -- The Phase 3 Boot Harness
+
+> This is the finale of the emulator walkthrough series. You have already seen the CPU, memory, bus, and I/O softswitches in isolation. `main.go` is where those components meet -- where a command-line flag becomes a loaded ROM, a ROM becomes a mapped device, a device becomes a booted CPU, and a booted CPU becomes a trace of real 6502 instructions running the Apple II monitor firmware. The file is intentionally small: at phase 3, it is a bootstrap harness, not a finished emulator. By the end of this walkthrough you will be able to read every line, explain every design choice, and see exactly which forward references from the previous walkthroughs land here.
+
+---
+
+## Section 0: Background -- What `main.go` Does at Phase 3
+
+You have read five walkthroughs in this series. Each one described a component in isolation:
+
+- **`walkthrough_cpu_go.md`** -- the MOS 6502 CPU: registers, flags, addressing modes, the fetch-decode-execute loop.
+- **`walkthrough_cpu_test_go.md`** -- the Klaus Dormann test suite: how we verify the CPU against a complete 6502 functional test ROM.
+- **`walkthrough_memory.md`** -- RAM and ROM: how 64 KB of byte storage is divided into pages, how `LoadROM` maps a binary file to a base address, how ROM blocks writes.
+- **`walkthrough_bus.md`** -- the bus router: how `Map` registers devices, how `Read`/`Write` scan from the tail to implement last-match-wins overlays, how `Dump` prints the map, what open-bus fallback means.
+- **`walkthrough_io.md`** -- softswitches: how memory-mapped I/O works on the Apple II, how a read at `$C054` (49,236) is itself a video-mode command, and how the softswitch block plugs into the bus.
+
+Every one of those walkthroughs ended with a forward pointer: "this piece becomes useful when `main.go` wires it together." The I/O walkthrough stated it plainly: "the finale walkthrough will be `main.go`, which is the wiring diagram tying CPU, bus, RAM, ROM, and softswitches into a runnable machine."
+
+This is the wiring diagram. It is where the separate components become a machine.
+
+### What Phase 3 Includes and Does Not Include
+
+**Phase 3 includes:** command-line flag parsing, ROM loading with automatic size detection, RAM construction, softswitch construction, bus construction, three `Map` calls that assemble the Apple II+ memory layout, a bus map dump to stdout, CPU construction and reset, manual reset-vector readout, an instruction trace loop with inline disassembly, a stuck-loop detector, a post-mortem register dump, and a raw hex preview of the first three text-screen rows.
+
+**Phase 3 does not include:** an interactive keyboard input loop (that belongs to phase 4), real video rendering (a text or graphics renderer comes later), audio output (speaker-toggle to PCM conversion is a later concern), Disk II slot 6 (phase 4+ with WOZ or DSK images), bank switching and the language card (a later bus rework), save/load state, or any kind of TUI or GUI frontend. Phase 3 is the smallest `main` that actually boots a real Apple II+ ROM and produces meaningful output. That is not a limitation -- it is a deliberate decision to verify correctness before adding complexity.
+
+### Full Source Code
+
+```go
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	"github.com/apple2emu/bus"
+	"github.com/apple2emu/cpu"
+	appleio "github.com/apple2emu/io"
+	"github.com/apple2emu/memory"
+)
+
+func main() {
+	romPath := flag.String("rom", "roms/apple2plus.rom", "Path to Apple II ROM image")
+	traceCount := flag.Int("trace", 200, "Number of instructions to trace (0 = run until loop)")
+	flag.Parse()
+
+	// --- Load ROM -----------------------------------------------------------
+	// Apple II+ ROM: 12 KB mapped at $D000–$FFFF
+	// Some dumps are 16 KB ($C000–$FFFF, includes slot ROM area)
+	rom, err := loadROM(*romPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+		fmt.Fprintln(os.Stderr, "To get started, place an Apple II+ ROM in the roms/ directory:")
+		fmt.Fprintln(os.Stderr, "  mkdir -p roms")
+		fmt.Fprintln(os.Stderr, "  cp /path/to/apple2plus.rom roms/")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Common ROM sizes:")
+		fmt.Fprintln(os.Stderr, "  12288 bytes (12 KB) — standard Apple II+ ROM ($D000–$FFFF)")
+		fmt.Fprintln(os.Stderr, "  16384 bytes (16 KB) — extended dump ($C000–$FFFF)")
+		os.Exit(1)
+	}
+
+	// --- Wire the bus -------------------------------------------------------
+	ram := memory.NewRAM()
+	sw := appleio.NewSoftSwitches()
+	b := bus.NewBus()
+
+	// Base layer: RAM across the full space (ROM overlays on top)
+	b.Map(0x0000, 0xBFFF, ram)
+
+	// I/O soft switches
+	b.Map(0xC000, 0xC0FF, sw)
+
+	// Slot ROM area — empty for now (reads $00)
+	// Later iterations will populate slots (e.g., Disk II in slot 6).
+
+	// ROM overlay — sits on top of RAM in the ROM region
+	b.Map(rom.Base, rom.End(), rom)
+
+	fmt.Printf("Apple II Emulator — Iteration 2\n")
+	fmt.Printf("ROM: %s (%d bytes at $%04X–$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
+	fmt.Println("Bus map:")
+	b.Dump()
+	fmt.Println()
+
+	// --- Boot the CPU -------------------------------------------------------
+	c := cpu.NewCPU(b)
+	c.Reset()
+
+	resetVec := uint16(b.Read(0xFFFC)) | uint16(b.Read(0xFFFD))<<8
+	fmt.Printf("Reset vector: $%04X\n", resetVec)
+	fmt.Printf("Starting CPU trace (%d instructions)...\n\n", *traceCount)
+
+	// --- Trace execution ----------------------------------------------------
+	prevPC := c.PC
+	stuckCount := 0
+
+	for i := 0; i < *traceCount || *traceCount == 0; i++ {
+		pc := c.PC
+		op := b.Read(pc)
+		b1 := b.Read(pc + 1)
+		b2 := b.Read(pc + 2)
+
+		name := opNames[op]
+		size := opSizes[op]
+
+		// Format the raw bytes column
+		var bytesStr string
+		switch size {
+		case 1:
+			bytesStr = fmt.Sprintf("%02X      ", op)
+		case 2:
+			bytesStr = fmt.Sprintf("%02X %02X   ", op, b1)
+		case 3:
+			bytesStr = fmt.Sprintf("%02X %02X %02X", op, b1, b2)
+		default:
+			bytesStr = fmt.Sprintf("%02X      ", op)
+		}
+
+		fmt.Printf("%04X  %s  %-4s  A:%02X X:%02X Y:%02X SP:%02X P:%02X\n",
+			pc, bytesStr, name, c.A, c.X, c.Y, c.SP, c.P)
+
+		c.Step()
+
+		// Detect stuck loops (JMP to self)
+		if c.PC == prevPC {
+			stuckCount++
+			if stuckCount > 2 {
+				fmt.Printf("\n--- CPU stuck at $%04X (JMP to self) ---\n", c.PC)
+				break
+			}
+		} else {
+			stuckCount = 0
+		}
+		prevPC = c.PC
+	}
+
+	fmt.Printf("\nFinal state: PC:%04X A:%02X X:%02X Y:%02X SP:%02X P:%02X  Cycles:%d\n",
+		c.PC, c.A, c.X, c.Y, c.SP, c.P, c.Cycles)
+
+	// Show what's in the text screen area ($0400–$07FF) — preview for iter 3
+	fmt.Println("\nText page 1 preview (first 3 rows, raw bytes):")
+	for row := 0; row < 3; row++ {
+		base := textRowAddr(row)
+		fmt.Printf("  $%04X: ", base)
+		for col := 0; col < 40; col++ {
+			ch := ram.Data[base+uint16(col)]
+			fmt.Printf("%02X ", ch)
+		}
+		fmt.Println()
+	}
+}
+
+// loadROM detects the ROM size and sets the correct base address.
+func loadROM(path string) (*memory.ROM, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	size := info.Size()
+	switch size {
+	case 12288: // 12 KB — standard Apple II+ ROM
+		return memory.LoadROM(path, 0xD000)
+	case 16384: // 16 KB — includes $C000 area
+		return memory.LoadROM(path, 0xC000)
+	default:
+		// Try to guess: if it's close to 12K, use $D000
+		if size > 0 && size <= 12288 {
+			return memory.LoadROM(path, uint16(0x10000-size))
+		}
+		return nil, fmt.Errorf("unexpected ROM size %d bytes (expected 12288 or 16384)", size)
+	}
+}
+
+// textRowAddr returns the base address for a text screen row.
+// The Apple II text screen has a non-linear layout.
+func textRowAddr(row int) uint16 {
+	// Each group of 8 rows is offset by $80; within a group, rows are $28 apart.
+	return 0x0400 + uint16(row/8)*0x28 + uint16(row%8)*0x80
+}
+
+// ---------------------------------------------------------------------------
+// Opcode names and sizes for disassembly trace
+// ---------------------------------------------------------------------------
+
+var opNames [256]string
+var opSizes [256]uint8
+
+func init() {
+	// Default: unknown
+	for i := range opNames {
+		opNames[i] = "???"
+		opSizes[i] = 1
+	}
+
+	n := func(op byte, name string, size uint8) {
+		opNames[op] = name
+		opSizes[op] = size
+	}
+
+	// Load/Store
+	n(0xA9, "LDA", 2)
+	n(0xA5, "LDA", 2)
+	n(0xB5, "LDA", 2)
+	n(0xAD, "LDA", 3)
+	n(0xBD, "LDA", 3)
+	n(0xB9, "LDA", 3)
+	n(0xA1, "LDA", 2)
+	n(0xB1, "LDA", 2)
+	n(0xA2, "LDX", 2)
+	n(0xA6, "LDX", 2)
+	n(0xB6, "LDX", 2)
+	n(0xAE, "LDX", 3)
+	n(0xBE, "LDX", 3)
+	n(0xA0, "LDY", 2)
+	n(0xA4, "LDY", 2)
+	n(0xB4, "LDY", 2)
+	n(0xAC, "LDY", 3)
+	n(0xBC, "LDY", 3)
+	n(0x85, "STA", 2)
+	n(0x95, "STA", 2)
+	n(0x8D, "STA", 3)
+	n(0x9D, "STA", 3)
+	n(0x99, "STA", 3)
+	n(0x81, "STA", 2)
+	n(0x91, "STA", 2)
+	n(0x86, "STX", 2)
+	n(0x96, "STX", 2)
+	n(0x8E, "STX", 3)
+	n(0x84, "STY", 2)
+	n(0x94, "STY", 2)
+	n(0x8C, "STY", 3)
+
+	// Transfers
+	n(0xAA, "TAX", 1)
+	n(0xA8, "TAY", 1)
+	n(0x8A, "TXA", 1)
+	n(0x98, "TYA", 1)
+	n(0xBA, "TSX", 1)
+	n(0x9A, "TXS", 1)
+
+	// Stack
+	n(0x48, "PHA", 1)
+	n(0x08, "PHP", 1)
+	n(0x68, "PLA", 1)
+	n(0x28, "PLP", 1)
+
+	// Arithmetic
+	n(0x69, "ADC", 2)
+	n(0x65, "ADC", 2)
+	n(0x75, "ADC", 2)
+	n(0x6D, "ADC", 3)
+	n(0x7D, "ADC", 3)
+	n(0x79, "ADC", 3)
+	n(0x61, "ADC", 2)
+	n(0x71, "ADC", 2)
+	n(0xE9, "SBC", 2)
+	n(0xE5, "SBC", 2)
+	n(0xF5, "SBC", 2)
+	n(0xED, "SBC", 3)
+	n(0xFD, "SBC", 3)
+	n(0xF9, "SBC", 3)
+	n(0xE1, "SBC", 2)
+	n(0xF1, "SBC", 2)
+
+	// Logic
+	n(0x29, "AND", 2)
+	n(0x25, "AND", 2)
+	n(0x35, "AND", 2)
+	n(0x2D, "AND", 3)
+	n(0x3D, "AND", 3)
+	n(0x39, "AND", 3)
+	n(0x21, "AND", 2)
+	n(0x31, "AND", 2)
+	n(0x09, "ORA", 2)
+	n(0x05, "ORA", 2)
+	n(0x15, "ORA", 2)
+	n(0x0D, "ORA", 3)
+	n(0x1D, "ORA", 3)
+	n(0x19, "ORA", 3)
+	n(0x01, "ORA", 2)
+	n(0x11, "ORA", 2)
+	n(0x49, "EOR", 2)
+	n(0x45, "EOR", 2)
+	n(0x55, "EOR", 2)
+	n(0x4D, "EOR", 3)
+	n(0x5D, "EOR", 3)
+	n(0x59, "EOR", 3)
+	n(0x41, "EOR", 2)
+	n(0x51, "EOR", 2)
+
+	// Shift/Rotate
+	n(0x0A, "ASL", 1)
+	n(0x06, "ASL", 2)
+	n(0x16, "ASL", 2)
+	n(0x0E, "ASL", 3)
+	n(0x1E, "ASL", 3)
+	n(0x4A, "LSR", 1)
+	n(0x46, "LSR", 2)
+	n(0x56, "LSR", 2)
+	n(0x4E, "LSR", 3)
+	n(0x5E, "LSR", 3)
+	n(0x2A, "ROL", 1)
+	n(0x26, "ROL", 2)
+	n(0x36, "ROL", 2)
+	n(0x2E, "ROL", 3)
+	n(0x3E, "ROL", 3)
+	n(0x6A, "ROR", 1)
+	n(0x66, "ROR", 2)
+	n(0x76, "ROR", 2)
+	n(0x6E, "ROR", 3)
+	n(0x7E, "ROR", 3)
+
+	// Inc/Dec
+	n(0xE6, "INC", 2)
+	n(0xF6, "INC", 2)
+	n(0xEE, "INC", 3)
+	n(0xFE, "INC", 3)
+	n(0xC6, "DEC", 2)
+	n(0xD6, "DEC", 2)
+	n(0xCE, "DEC", 3)
+	n(0xDE, "DEC", 3)
+	n(0xE8, "INX", 1)
+	n(0xC8, "INY", 1)
+	n(0xCA, "DEX", 1)
+	n(0x88, "DEY", 1)
+
+	// Compare
+	n(0xC9, "CMP", 2)
+	n(0xC5, "CMP", 2)
+	n(0xD5, "CMP", 2)
+	n(0xCD, "CMP", 3)
+	n(0xDD, "CMP", 3)
+	n(0xD9, "CMP", 3)
+	n(0xC1, "CMP", 2)
+	n(0xD1, "CMP", 2)
+	n(0xE0, "CPX", 2)
+	n(0xE4, "CPX", 2)
+	n(0xEC, "CPX", 3)
+	n(0xC0, "CPY", 2)
+	n(0xC4, "CPY", 2)
+	n(0xCC, "CPY", 3)
+
+	// Bit
+	n(0x24, "BIT", 2)
+	n(0x2C, "BIT", 3)
+
+	// Branches
+	n(0x90, "BCC", 2)
+	n(0xB0, "BCS", 2)
+	n(0xF0, "BEQ", 2)
+	n(0x30, "BMI", 2)
+	n(0xD0, "BNE", 2)
+	n(0x10, "BPL", 2)
+	n(0x50, "BVC", 2)
+	n(0x70, "BVS", 2)
+
+	// Jump
+	n(0x4C, "JMP", 3)
+	n(0x6C, "JMP", 3)
+	n(0x20, "JSR", 3)
+	n(0x60, "RTS", 1)
+	n(0x40, "RTI", 1)
+
+	// Flags
+	n(0x18, "CLC", 1)
+	n(0x38, "SEC", 1)
+	n(0xD8, "CLD", 1)
+	n(0xF8, "SED", 1)
+	n(0x58, "CLI", 1)
+	n(0x78, "SEI", 1)
+	n(0xB8, "CLV", 1)
+
+	// Misc
+	n(0xEA, "NOP", 1)
+	n(0x00, "BRK", 1)
+}
+```
+
+### Top-Level Architecture (Diagram 1)
+
+```
+  command line                       +-----------------+
+  -rom foo.rom  ------> flag.Parse   | romPath string  |
+  -trace 200                         | traceCount int  |
+                                     +--------+--------+
+                                              |
+                                              v
+                                       +-------------+
+                                       |  loadROM()  |
+                                       +------+------+
+                                              |
+                                              v
+                       +----------+   +----------------+   +-------------+
+                       | NewRAM() |   |NewSoftSwitches()|  | *memory.ROM |
+                       +----+-----+   +------+---------+  +------+------+
+                            |                |                   |
+                            v                v                   v
+                         +--+----------------+-------------------+--+
+                         |                 bus.New()                 |
+                         |   b.Map($0000,$BFFF, ram)                 |
+                         |   b.Map($C000,$C0FF, sw)                  |
+                         |   b.Map(rom.Base, rom.End(), rom)         |
+                         +-----------------+-------------------------+
+                                           |
+                                           v
+                                     cpu.NewCPU(b)
+                                           |
+                                           v
+                                       c.Reset()
+                                           |
+                                           v
+                         +-----------------+------------------+
+                         |     trace loop: c.Step() x N       |
+                         |  disassemble opcode, print regs    |
+                         |  detect JMP-to-self stuck loop     |
+                         +-----------------+------------------+
+                                           |
+                                           v
+                           post-mortem: final state + text page preview
+                                           |
+                                           v
+                                         exit(0)
+```
+
+The rest of this walkthrough walks the code top to bottom, but if you ever get lost, scroll back to the diagram above.
+
+---
+
+## Section 1: Package and Imports (lines 1-12)
+
+### What It Is
+
+```go
+package main
+
+import (
+    "flag"
+    "fmt"
+    "os"
+
+    "github.com/apple2emu/bus"
+    "github.com/apple2emu/cpu"
+    appleio "github.com/apple2emu/io"
+    "github.com/apple2emu/memory"
+)
+```
+
+### Why It Matters
+
+`package main` is what makes this file the entry point of an executable. A Go source file declaring any other package name -- even with a `func main()` inside -- will not build as a runnable command. This declaration is the contract with the Go toolchain.
+
+The import list is a dependency map. Seven lines tell you everything `main.go` needs from the outside world: three standard library packages and four internal packages. If you had never seen this file before, the import block alone would tell you the story: "this program parses arguments, writes to stdout/stderr, reads files, uses a bus, a CPU, an I/O layer, and memory."
+
+### How the Code Works
+
+**`package main`**: Go's single convention for executables. Every Go program that compiles to a binary has exactly one `package main` across the entire project, with exactly one `func main()` inside it.
+
+**Standard library imports**:
+- `flag` -- Go's built-in command-line argument parser. We will see it in detail in sub-section 2a.
+- `fmt` -- formatted I/O, essentially `printf` and `println` for Go. Used throughout the file for trace output and diagnostics.
+- `os` -- operating system interface: file stat, file read, stderr handle, exit codes. Used in `loadROM` and in the error handler.
+
+**Go module paths** (`github.com/apple2emu/...`): Go modules use an import path as a unique identifier for the project and its packages. The URL-like prefix `github.com/apple2emu` is a convention, not a requirement that a real GitHub repository exist at that address. The `go.mod` file at the project root declares this module name, and every Go file inside the project uses paths prefixed with that name to import sibling packages. Think of `github.com/apple2emu` as the project's namespace, not a website.
+
+**Aliased import** (`appleio "github.com/apple2emu/io"`): this is the most interesting line in the import block, and it is worth understanding fully. Go's standard library has a package named `io` -- it defines `Reader`, `Writer`, and other stream interfaces used throughout Go programming. Our emulator also has a package named `io` at `github.com/apple2emu/io`. If both were imported with their natural short names, the compiler would see two different packages both called `io` and refuse to build.
+
+Even though `main.go` does not currently import stdlib `io`, aliasing our emulator's I/O package as `appleio` removes the collision landmine permanently. Any future developer who wants to add `"io"` to the import list can do so without renaming every call site. The result shows up throughout the file: `appleio.NewSoftSwitches()` instead of `io.NewSoftSwitches()`. The alias appears on the left of the quoted path and becomes the identifier used in code.
+
+### Real-World Analogy
+
+> The import list is a staff directory for an office building. It tells you who lives in which suite, so when you need to route a task -- "please format this number," "please read that file," "please give me a fresh softswitch bank" -- you know exactly where to knock. Aliasing `io` to `appleio` is like having two employees named Alex: before they ever meet, you give one of them a badge that says "Apple-Alex" so nobody gets confused at the coffee machine.
+
+---
+
+## Section 2: `main()` -- The Entry Point (lines 14-124)
+
+The body of `main()` reads linearly from top to bottom as six phases, separated in the source by `// ---` comment rules. We will walk each phase in turn, and each phase is small enough to hold in your head all at once.
+
+### Sub-section 2a: Flag Parsing
+
+```go
+romPath := flag.String("rom", "roms/apple2plus.rom", "Path to Apple II ROM image")
+traceCount := flag.Int("trace", 200, "Number of instructions to trace (0 = run until loop)")
+flag.Parse()
+```
+
+Go's `flag` package is the standard library's answer to command-line argument parsing. Each call to `flag.String` or `flag.Int` registers a named flag and returns a pointer -- `*string` or `*int` respectively. The pointer is important: at the time `flag.String` runs, no command-line parsing has happened yet. The returned pointer is a handle you can read AFTER `flag.Parse()` does the actual work. If `flag.String` returned a plain `string`, that string would be frozen at the default value with no way to update it when the user passes a different value.
+
+`flag.Parse()` walks `os.Args` (the raw command-line arguments), matches each `-name value` pair against the registered flags, and populates the variables through their pointers. After this line, `*romPath` dereferences the pointer to read the actual ROM path, and `*traceCount` gives the trace limit.
+
+A practical example:
+
+```
+$ ./apple2emu -rom roms/apple2plus.rom -trace 500
+```
+
+`flag.Parse` sees `-rom roms/apple2plus.rom`: it matches the "rom" registration, stores `"roms/apple2plus.rom"` in the backing string, and `*romPath` reads `"roms/apple2plus.rom"`. It then sees `-trace 500`: it matches the "trace" registration, parses the integer 500, and `*traceCount` reads `500`.
+
+One free side effect: running `./apple2emu -h` prints each registered flag with its default value and help text automatically. The flag package generates that usage output from the three arguments you already passed to `flag.String` and `flag.Int`.
+
+### Sub-section 2b: `loadROM` Call and the Helpful Error Message
+
+```go
+rom, err := loadROM(*romPath)
+if err != nil {
+    fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+    fmt.Fprintln(os.Stderr, "To get started, place an Apple II+ ROM in the roms/ directory:")
+    fmt.Fprintln(os.Stderr, "  mkdir -p roms")
+    fmt.Fprintln(os.Stderr, "  cp /path/to/apple2plus.rom roms/")
+    fmt.Fprintln(os.Stderr, "")
+    fmt.Fprintln(os.Stderr, "Common ROM sizes:")
+    fmt.Fprintln(os.Stderr, "  12288 bytes (12 KB) — standard Apple II+ ROM ($D000–$FFFF)")
+    fmt.Fprintln(os.Stderr, "  16384 bytes (16 KB) — extended dump ($C000–$FFFF)")
+    os.Exit(1)
+}
+```
+
+`loadROM(*romPath)` returns `(*memory.ROM, error)`. This is Go's idiomatic multi-return error pattern: the last return value is an `error` interface, which is `nil` on success and carries a message on failure. We check `if err != nil` immediately after any fallible call.
+
+On failure, diagnostics go to `os.Stderr`, not `os.Stdout`. This is the Unix convention: stderr is the channel for error output so that `./apple2emu > out.txt` still shows the user the error on their terminal while capturing any successful trace output to a file. `fmt.Fprintln(os.Stderr, ...)` writes a line to stderr; `fmt.Fprintf(os.Stderr, ...)` writes a formatted string.
+
+The multi-line "how to get started" hint is a deliberate UX choice. Nobody remembers the exact directory to drop the ROM into after being away from the project for a month -- so the error message itself teaches the reader. The binary provides its own onboarding documentation through failure.
+
+`os.Exit(1)`: exits the process with exit code 1. By convention, nonzero exit codes mean "something broke" -- shell scripts and CI pipelines test this value. Note that `os.Exit` is an abrupt stop: it does not run any deferred functions that were registered with `defer`. For a simple harness like this, that is fine.
+
+### Sub-section 2c: Constructing the Three Devices
+
+```go
+ram := memory.NewRAM()
+sw := appleio.NewSoftSwitches()
+b := bus.New()
+```
+
+Three constructors, three values. The ROM was already built by `loadROM` above, so we do not need a fourth constructor here.
+
+`memory.NewRAM()` allocates 64 KB of zeroed storage. The RAM constructor is covered in the memory walkthrough (Section 2: NewRAM). `appleio.NewSoftSwitches()` creates the softswitch block with its initial state (text mode on, keyboard cleared). The softswitch constructor is covered in the I/O walkthrough (Section 2: NewSoftSwitches). `bus.New()` creates an empty router with no devices mapped. The bus constructor is covered in the bus walkthrough (Section 3: New).
+
+Declaration order here does not matter: none of the four constructors calls any of the others. The bus `b` is a blank router until we call `Map` -- and that is the next sub-section.
+
+### Sub-section 2d: Wiring the Bus -- Three `Map` Calls
+
+```go
+// Base layer: RAM across the full space (ROM overlays on top)
+b.Map(0x0000, 0xBFFF, ram)
+
+// I/O soft switches
+b.Map(0xC000, 0xC0FF, sw)
+
+// Slot ROM area -- empty for now (reads $00)
+// Later iterations will populate slots (e.g., Disk II in slot 6).
+
+// ROM overlay -- sits on top of RAM in the ROM region
+b.Map(rom.Base, rom.End(), rom)
+```
+
+This is the most important sub-section in the entire walkthrough. Every forward pointer in every previous walkthrough lands here. These three lines are the reason the bus exists at all.
+
+**The three `Map` calls, one at a time**:
+
+1. `b.Map(0x0000, 0xBFFF, ram)` covers addresses `$0000` through `$BFFF` (0 through 49,151). This is the RAM layer -- zero page, the stack page, the six text and graphics screen pages, and all of upper RAM available for programs.
+
+2. `b.Map(0xC000, 0xC0FF, sw)` covers addresses `$C000` through `$C0FF` (49,152 through 49,407). This is the 256-byte I/O softswitch window. Reads and writes here trigger hardware state changes rather than simply accessing bytes. (See the I/O walkthrough Section 3 for the full read-with-side-effects mechanism.)
+
+3. `b.Map(rom.Base, rom.End(), rom)` uses dynamic bounds. For a 12 KB ROM, `rom.Base` is `$D000` (53,248) and `rom.End()` returns `$FFFF` (65,535). For a 16 KB ROM, `rom.Base` is `$C000` (49,152) and `rom.End()` is still `$FFFF`. The `memory.LoadROM` function sets these fields based on the base address passed in; see the memory walkthrough's ROM section for `Base`, `End`, and `Size`.
+
+**Why RAM ends at `$BFFF` instead of `$FFFF`**: We could have written `b.Map(0x0000, 0xFFFF, ram)` and relied entirely on last-match-wins to handle the I/O and ROM regions. Ending RAM cleanly at `$BFFF` is a self-documenting choice -- the `b.Dump()` output maps cleanly to the Apple II+ memory layout at a glance. Both approaches produce the same behavior at runtime. The bus walkthrough Section 4 (Map) covers the mechanics of range registration.
+
+**Overlay order and last-match-wins -- the payoff for every forward reference**: The bus `Read` method scans its mapping list from the tail backward, and the last matching mapping wins. This is the mechanism described in bus walkthrough Section 5 (Read) and Section 8 (Putting It Together). Here is how the three calls play out:
+
+- RAM was registered first. It is the base layer for everything in `$0000`-`$BFFF`.
+- The softswitch block was registered second. For any address in `$C000`-`$C0FF`, the bus scan reaches the softswitch entry before the RAM entry. Softswitches win over RAM in that window.
+- ROM was registered third. For any address in `$D000`-`$FFFF`, the bus scan reaches the ROM entry before the RAM entry. ROM wins over RAM in that region.
+
+Map registration order IS execution order for overlays, and we build them up from base layer to final overlay, last call wins.
+
+One edge case worth stating honestly: for the 16 KB ROM path, `rom.Base` is `$C000`, meaning ROM overlaps the I/O window. In the current code, ROM is registered AFTER the softswitch block, so ROM wins over the softswitches from `$C000` to `$C0FF` -- the softswitches are invisible when a 16 KB ROM is loaded. The 12 KB case is the tested path; the 16 KB overlap is a phase-3 limitation that a phase-4 bus rework will address.
+
+**The slot ROM comment**: The commented-out note about slot ROM at `$C100`-`$CFFF` is a forward pointer. In a fully equipped Apple II+, slots 1 through 7 each get a 256-byte window at `$Cn00` (so slot 1 at `$C100`, slot 2 at `$C200`, and so on through slot 7 at `$C700`), plus a shared 2 KB expansion-ROM area at `$C800`-`$CFFF` that cards can page in on demand. At phase 3, no slot cards are installed and no ROM is mapped there. Reads in that range fall off the end of the bus scan and return `$FF` via open-bus fallback (described in bus walkthrough Section 5). The full memory map context is in memory walkthrough Section 4 (Putting It Together).
+
+**Effective memory map after the three `Map` calls (Diagram 2)**:
+
+```
+  Address range       Device           Won by              Decimal range
+  ------------------  ---------------  ------------------  ---------------
+  $0000 - $BFFF       RAM              1st Map call        0     - 49151
+  $C000 - $C0FF       SoftSwitches     2nd Map call        49152 - 49407
+  $C100 - $CFFF       (unmapped)       none -- open bus    49408 - 53247
+  $D000 - $FFFF       ROM              3rd Map call        53248 - 65535
+```
+
+The gap from `$C100` to `$CFFF` (49,408 through 53,247) is intentional. RAM ends at `$BFFF`, the softswitch window covers only `$C000`-`$C0FF`, and ROM starts at `$D000`. There is no device mapped in between. Any read in that gap falls through the bus scan without a match and returns `$FF` -- the open-bus value. On a real Apple II+, this region is the slot ROM space for expansion cards in slots 1-7. The emulator leaves it empty until slot cards are added in a later phase. This behavior is correct for a stock Apple II+ with no cards installed.
+
+### Sub-section 2e: Printing the Bus Map
+
+```go
+fmt.Printf("Apple II Emulator -- Iteration 2\n")
+fmt.Printf("ROM: %s (%d bytes at $%04X--$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
+fmt.Println("Bus map:")
+b.Dump()
+fmt.Println()
+```
+
+`b.Dump()` iterates through every registered mapping and prints one line per device. The bus walkthrough Section 7 (Dump) covers exactly what this produces and how it formats the output. A typical run looks like:
+
+```
+Apple II Emulator -- Iteration 2
+ROM: roms/apple2plus.rom (12288 bytes at $D000--$FFFF)
+Bus map:
+  $0000-$BFFF *memory.RAM
+  $C000-$C0FF *io.SoftSwitches
+  $D000-$FFFF *memory.ROM
+```
+
+Why print this before executing a single instruction? A wrong memory map is one of the most common emulator bugs. If `$D000` shows up backed by RAM, the boot will fail silently: the CPU reads two zero bytes at `$FFFC`/`$FFFD`, sets PC to `$0000`, and starts executing whatever garbage is in zero page. Printing the map at startup lets you eyeball it against the known-good Apple II+ layout before the trace begins. If anything is wrong, you see it on the first line of output -- before spending five minutes wondering why the trace looks strange.
+
+### Sub-section 2f: Boot the CPU
+
+```go
+c := cpu.NewCPU(b)
+c.Reset()
+
+resetVec := uint16(b.Read(0xFFFC)) | uint16(b.Read(0xFFFD))<<8
+fmt.Printf("Reset vector: $%04X\n", resetVec)
+fmt.Printf("Starting CPU trace (%d instructions)...\n\n", *traceCount)
+```
+
+`cpu.NewCPU(b)` creates a CPU and wires it to the bus. The CPU's constructor accepts anything satisfying the `cpu.Memory` interface, which requires `Read(addr uint16) byte` and `Write(addr uint16, val byte)`. Our bus has exactly those methods with exactly those signatures, so it satisfies the interface through Go's structural typing -- no explicit declaration required. This is covered in the CPU walkthrough Section 3 (Memory Interface) and in the bus walkthrough Section 1 (Device Interface).
+
+`c.Reset()` simulates pressing the RESET button on a real Apple II. It reads the two bytes at `$FFFC` (65,532) and `$FFFD` (65,533), assembles them into a 16-bit little-endian address, and loads that address into PC. After this call, the CPU is ready to execute from the monitor ROM's entry point. The full reset mechanics are covered in the CPU walkthrough Section 5 (New and Reset).
+
+The next two lines manually read the reset vector from the bus and print it:
+
+```go
+resetVec := uint16(b.Read(0xFFFC)) | uint16(b.Read(0xFFFD))<<8
+```
+
+Let's walk through this carefully. `b.Read(0xFFFC)` returns a `byte` (alias `uint8`), which is an 8-bit unsigned integer. To OR a second byte into the high position we need 16 bits of space, so `uint16(b.Read(0xFFFC))` widens the low byte to 16 bits without changing its value. `uint16(b.Read(0xFFFD)) << 8` widens the high byte and shifts it left 8 positions so it occupies bits 8-15. The bitwise OR combines both halves into one 16-bit address. This is the same little-endian assembly pattern covered in the memory walkthrough and the CPU walkthrough -- two bytes in memory, low byte first, high byte second.
+
+`c.PC` already holds this value after `c.Reset()`. Reading the bus manually here is purely diagnostic: the print in the trace output reminds anyone reading a log exactly where the ROM starts. For the standard Apple II+ 12 KB ROM, the reset vector typically points to an address in the `$FF00`-`$FFFF` (65,280-65,535) range, for example `$FF59` (65,369).
+
+### Sub-section 2g: The Trace Loop
+
+```go
+prevPC := c.PC
+stuckCount := 0
+
+for i := 0; i < *traceCount || *traceCount == 0; i++ {
+    pc := c.PC
+    op := b.Read(pc)
+    b1 := b.Read(pc + 1)
+    b2 := b.Read(pc + 2)
+
+    name := opNames[op]
+    size := opSizes[op]
+
+    var bytesStr string
+    switch size {
+    case 1:
+        bytesStr = fmt.Sprintf("%02X      ", op)
+    case 2:
+        bytesStr = fmt.Sprintf("%02X %02X   ", op, b1)
+    case 3:
+        bytesStr = fmt.Sprintf("%02X %02X %02X", op, b1, b2)
+    default:
+        bytesStr = fmt.Sprintf("%02X      ", op)
+    }
+
+    fmt.Printf("%04X  %s  %-4s  A:%02X X:%02X Y:%02X SP:%02X P:%02X\n",
+        pc, bytesStr, name, c.A, c.X, c.Y, c.SP, c.P)
+
+    c.Step()
+
+    if c.PC == prevPC {
+        stuckCount++
+        if stuckCount > 2 {
+            fmt.Printf("\n--- CPU stuck at $%04X (JMP to self) ---\n", c.PC)
+            break
+        }
+    } else {
+        stuckCount = 0
+    }
+    prevPC = c.PC
+}
+```
+
+This loop is the heart of the harness. Everything built so far -- the bus, the RAM, the ROM, the CPU -- exists to make this loop possible.
+
+**The setup before the loop**: `prevPC` remembers the last PC value. `stuckCount` counts consecutive iterations where PC did not move. Both exist for the stuck-loop detector described below.
+
+**The `for` condition**: `for i := 0; i < *traceCount || *traceCount == 0; i++`. This is a Go idiom for "run N times OR run forever." When `*traceCount` is a positive number, `i < *traceCount` eventually becomes false and the loop exits normally. When `*traceCount` is 0, the second operand `*traceCount == 0` is always true, so the entire OR is always true. Concrete example: running `./apple2emu -trace 0` means the counter never exits the loop, and only the stuck-loop detector can break out. Running `-trace 200` (the default) exits after 200 iterations regardless of what the CPU is doing.
+
+**Peek and disassemble**: Before calling `c.Step()`, we peek at three bytes starting at the current PC: `op`, `b1`, and `b2`. `op` is the opcode. `b1` and `b2` are the potential first and second operand bytes. We look up `opNames[op]` and `opSizes[op]` from the tables filled by `init()` (covered in Section 5 of this walkthrough). The size tells us how many of the peeked bytes actually belong to this instruction.
+
+**The bytes column formatter**: the `switch size` block builds a fixed-width string of hex bytes for the trace line. A 1-byte instruction uses only `op`; a 2-byte instruction uses `op` and `b1`; a 3-byte instruction uses all three. Padding spaces are included in each case string so every trace line has the same column width. Peeked bytes `b1` and `b2` are harmless when `size < 3` -- they are read from memory but never included in the formatted output.
+
+**The print line**: each trace line looks like:
+
+```
+%04X  %s  %-4s  A:%02X X:%02X Y:%02X SP:%02X P:%02X
+```
+
+- `%04X` for PC: exactly 4 uppercase hex digits with leading zeros.
+- `%s` for the bytes column: the fixed-width hex string built above.
+- `%-4s` for the mnemonic: left-justified in a 4-character field so the register columns align.
+- `%02X` for each register: exactly 2 hex digits with leading zeros.
+
+**`c.Step()`**: one complete fetch-decode-execute cycle. The CPU reads the opcode at PC, decodes its addressing mode, fetches any operand bytes, executes the operation, updates registers and flags, advances PC, and increments the cycle counter. The full Step mechanics are covered in the CPU walkthrough Section 6 (Step).
+
+**Stuck-loop detection**: after `Step()` returns, we compare the new `c.PC` to `prevPC`. If they are equal, the CPU just executed an instruction that left PC unchanged -- almost certainly a `JMP` to the current address, the 6502's equivalent of an idle spin (`JMP *` in assembly notation). We increment `stuckCount`. When `stuckCount` exceeds 2 (three consecutive same-PC observations), we print a stuck message and `break` out of the loop.
+
+The threshold of 3 avoids false positives. A single same-PC observation could theoretically occur in tight branch loops on some corner-case instruction sequences. Requiring three in a row is a low-cost safety margin. The cpu_test walkthrough's Section on the Klaus Dormann Test describes the same idea in the context of the Dormann test harness -- the test loop detects that the test ROM has reached its final idle loop by checking whether PC stopped advancing. This is the "real emulator uses the same trap-detection trick" forward pointer from that walkthrough, closed here.
+
+**Sample trace output (Diagram 3)**:
+
+```
+FF59  D8         CLD   A:00 X:00 Y:00 SP:FD P:24
+FF5A  58         CLI   A:00 X:00 Y:00 SP:FD P:24
+FF5B  A0 7F      LDY   A:00 X:00 Y:00 SP:FD P:20
+FF5D  8C F8 07   STY   A:00 X:00 Y:7F SP:FD P:20
+FF60  A9 00      LDA   A:00 X:00 Y:7F SP:FD P:20
+```
+
+Reading the first line: at PC `$FF59` (65,369), the next instruction is the 1-byte opcode `$D8`, which is `CLD` -- clear the decimal flag. The accumulator is zero, X is zero, Y is zero, the stack pointer is `$FD` (253), and the processor status register is `$24`. The trace prints registers **before** each instruction executes, so line 1 shows the state going INTO `CLD`. `CLD` clears bit 3 (the D flag), which was already 0 in `$24` = `0010 0100`, so the P register stays `$24` going into `CLI` on line 2. `CLI` then clears bit 2 (the I flag), which is why line 3 shows `$20` = `0010 0000` -- only bit 5 (the "unused" bit, always 1 on a real 6502) remains set. Refer to the CPU walkthrough's Status Flags section for the exact bit layout. The specific bytes above come from a standard Apple II+ Autostart ROM; the format will match for any loaded ROM image.
+
+### Sub-section 2h: Post-mortem
+
+```go
+fmt.Printf("\nFinal state: PC:%04X A:%02X X:%02X Y:%02X SP:%02X P:%02X  Cycles:%d\n",
+    c.PC, c.A, c.X, c.Y, c.SP, c.P, c.Cycles)
+
+fmt.Println("\nText page 1 preview (first 3 rows, raw bytes):")
+for row := 0; row < 3; row++ {
+    base := textRowAddr(row)
+    fmt.Printf("  $%04X: ", base)
+    for col := 0; col < 40; col++ {
+        ch := ram.Data[base+uint16(col)]
+        fmt.Printf("%02X ", ch)
+    }
+    fmt.Println()
+}
+```
+
+**Final register dump**: after the trace loop exits (by count or by stuck detection), we print the full CPU state one last time, including the cycle count `c.Cycles`. This is the post-mortem: a snapshot of where the ROM left the CPU at the end of the trace. Cross-reference the CPU walkthrough for the meaning of each register field.
+
+**Text screen preview**: the loop reads the first three rows of text page 1 and prints 40 hex bytes per row. A few things to note:
+
+- `textRowAddr(row)` computes the non-linear base address for each row. The formula is explained fully in Section 4 of this walkthrough.
+- `ram.Data[base+uint16(col)]` reads directly from the RAM backing array, bypassing the bus entirely. This is a style choice: after the CPU has stopped executing, nothing can change the RAM contents, so going directly to the backing store is both faster and slightly more explicit ("we know text page 1 is in RAM"). Using `b.Read(base + uint16(col))` would produce identical results -- it would route through the bus and return the same bytes from the same RAM cells. The choice is not a correctness requirement.
+- Text page 1 lives at `$0400` through `$07FF` (1,024 through 2,047), a 1 KB window that holds 24 rows of 40 characters. The Apple II monitor ROM typically writes specific character values into this region during its initialization sequence. If you see `$A0` repeated (160 decimal, the Apple II's screen-fill character with high bit set), the monitor cleared the screen successfully. If you see all zeroes, initialization may not have run yet.
+- This preview is a smoke test: it shows you whether the ROM touched the text screen during the traced instructions. Phase 4 will replace it with a real renderer that translates these byte values through the Apple II character ROM into visible glyphs.
+
+---
+
+## Section 3: `loadROM` -- Size Detection (lines 127-146)
+
+### What It Is
+
+```go
+func loadROM(path string) (*memory.ROM, error) {
+    info, err := os.Stat(path)
+    if err != nil {
+        return nil, err
+    }
+
+    size := info.Size()
+    switch size {
+    case 12288: // 12 KB -- standard Apple II+ ROM
+        return memory.LoadROM(path, 0xD000)
+    case 16384: // 16 KB -- includes $C000 area
+        return memory.LoadROM(path, 0xC000)
+    default:
+        if size > 0 && size <= 12288 {
+            return memory.LoadROM(path, uint16(0x10000-size))
+        }
+        return nil, fmt.Errorf("unexpected ROM size %d bytes (expected 12288 or 16384)", size)
+    }
+}
+```
+
+### Why It Matters
+
+Apple II+ ROM dumps exist in multiple sizes. A 12,288-byte (12 KB) dump contains exactly the `$D000` (53,248) through `$FFFF` (65,535) region -- 12,288 bytes of monitor firmware, Integer BASIC, and the Autostart ROM. A 16,384-byte (16 KB) dump extends down to `$C000` (49,152) and includes the slot ROM area as well.
+
+Loading a ROM at the wrong base address is a silent killer. If a 12 KB ROM is loaded at `$C000` instead of `$D000`, the reset vector at `$FFFC`/`$FFFD` would point to bytes inside the ROM that are not the intended entry point. The CPU would jump somewhere wrong and execute garbage. There is no runtime error; the boot simply fails in confusing ways. `loadROM` prevents this class of error by inspecting the file size before reading a single byte and choosing the base address automatically.
+
+### How the Code Works
+
+**`os.Stat(path)`**: returns a `FileInfo` value containing filesystem metadata -- size, permissions, modification time -- without reading the file contents. This is the key insight: we only need the file size to decide which base address to use. Calling `os.ReadFile(path)` would open the file, read all 12 KB or 16 KB into memory, and close it -- three system calls. `os.Stat` is a single metadata call. When you only need a field from the filesystem record, use `Stat`.
+
+**`size := info.Size()`**: `FileInfo.Size()` returns an `int64`. We stash it and switch on it.
+
+**The switch**:
+- `case 12288`: the standard 12 KB Apple II+ ROM. Base address `$D000` (53,248). This is the canonical layout and the tested path.
+- `case 16384`: the 16 KB extended dump including the slot ROM area. Base address `$C000` (49,152). As noted in sub-section 2d, loading this ROM creates an overlap with the softswitch window.
+- `default`: a fallback for unusual ROM sizes. If `size` is positive and at most 12,288, the formula `uint16(0x10000 - size)` computes the correct base address.
+
+**The `uint16(0x10000 - size)` trick**: every Apple II+ ROM image, regardless of size, must end at `$FFFF` (65,535) -- because the reset vector at `$FFFC`/`$FFFD` is the very last thing in the ROM before the final two bytes. A ROM of N bytes ending at `$FFFF` must start at address `65536 - N` (because `$10000` is 65,536, one past the 16-bit address space). Examples:
+
+```
+  ROM size    Decimal    Base address    Hex base
+  --------    -------    ------------    --------
+   2,048 B     2048      65536 - 2048    $F800
+   4,096 B     4096      65536 - 4096    $F000
+   8,192 B     8192      65536 - 8192    $E000
+  12,288 B    12288      65536 - 12288   $D000
+```
+
+The `uint16(...)` cast is safe because `size <= 12288` has already been verified, guaranteeing the result is at least `$D000` -- well within the 16-bit address space.
+
+**The error case**: if the file is larger than 12 KB and not exactly 16 KB, `loadROM` returns an error with a clear message. A 24 KB file might be a concatenated dump in a non-standard format; silently guessing a base address would mask the problem. The caller gets a clear error, fixes the file, and tries again. Cross-reference the memory walkthrough's ROM section for how `memory.LoadROM` reads the file and constructs the `*memory.ROM` struct with its `Base`, `End`, and `Size` fields.
+
+### Real-World Analogy
+
+> Think of `loadROM` as a receiving dock. A package arrives; you weigh it before opening it. If it weighs 12 pounds, it is the standard monitor ROM and you know which shelf it goes on. If it weighs 16 pounds, it is the extended dump and it goes on a lower shelf. Any other weight and you either fit it in a fallback slot by reading the label, or you refuse the delivery and ask the shipper to clarify. The receiving clerk never opens the box to check the contents -- the weight alone tells them where it belongs.
+
+---
+
+## Section 4: `textRowAddr` -- The Apple II's Interleaved Text Screen (lines 149-153)
+
+### What It Is
+
+```go
+func textRowAddr(row int) uint16 {
+    return 0x0400 + uint16(row/8)*0x28 + uint16(row%8)*0x80
+}
+```
+
+Five lines of source. Hidden behind them: a 1977 hardware trick that saved Woz a handful of TTL chips at the cost of permanently confusing programmers for the next fifty years.
+
+### Why It Matters
+
+The Apple II text screen is 40 columns wide by 24 rows tall, living in a 1,024-byte region from `$0400` (1,024) to `$07FF` (2,047). On a modern machine you would expect row `r` to start at `$0400 + r * 40`. It does not. The rows are interleaved in groups of 8. This interleaving is not a bug and not a compression trick -- it falls directly out of how the Apple II video hardware generated memory addresses using the minimum number of logic chips. Any program that wants to write to the screen, including the monitor ROM's `COUT` routine, has to know the interleave pattern. `textRowAddr` is the function that encodes that pattern.
+
+### How the Code Works
+
+The formula:
+
+```
+address = $0400 + (row / 8) * $28 + (row % 8) * $80
+```
+
+- `row / 8` gives the **group index** (0, 1, or 2) -- which group of 8 rows this row belongs to.
+- `row % 8` gives the **position within the group** (0 through 7).
+- `$28` = 40 decimal = the width of one text row in bytes. Moving from group 0 to group 1 to group 2 adds one row's worth of bytes.
+- `$80` = 128 decimal. Rows within a group are 128 bytes apart in memory.
+
+The full 24-row address table (Diagram 4):
+
+```
+  Row   Group   Within-group   Formula                    Address (hex)   Decimal
+  ---   -----   ------------   ------------------------   -------------   -------
+    0     0          0         $0400 + 0*$28 + 0*$80        $0400          1024
+    1     0          1         $0400 + 0*$28 + 1*$80        $0480          1152
+    2     0          2         $0400 + 0*$28 + 2*$80        $0500          1280
+    3     0          3         $0400 + 0*$28 + 3*$80        $0580          1408
+    4     0          4         $0400 + 0*$28 + 4*$80        $0600          1536
+    5     0          5         $0400 + 0*$28 + 5*$80        $0680          1664
+    6     0          6         $0400 + 0*$28 + 6*$80        $0700          1792
+    7     0          7         $0400 + 0*$28 + 7*$80        $0780          1920
+    8     1          0         $0400 + 1*$28 + 0*$80        $0428          1064
+    9     1          1         $0400 + 1*$28 + 1*$80        $04A8          1192
+   10     1          2         $0400 + 1*$28 + 2*$80        $0528          1320
+   11     1          3         $0400 + 1*$28 + 3*$80        $05A8          1448
+   12     1          4         $0400 + 1*$28 + 4*$80        $0628          1576
+   13     1          5         $0400 + 1*$28 + 5*$80        $06A8          1704
+   14     1          6         $0400 + 1*$28 + 6*$80        $0728          1832
+   15     1          7         $0400 + 1*$28 + 7*$80        $07A8          1960
+   16     2          0         $0400 + 2*$28 + 0*$80        $0450          1104
+   17     2          1         $0400 + 2*$28 + 1*$80        $04D0          1232
+   18     2          2         $0400 + 2*$28 + 2*$80        $0550          1360
+   19     2          3         $0400 + 2*$28 + 3*$80        $05D0          1488
+   20     2          4         $0400 + 2*$28 + 4*$80        $0650          1616
+   21     2          5         $0400 + 2*$28 + 5*$80        $06D0          1744
+   22     2          6         $0400 + 2*$28 + 6*$80        $0750          1872
+   23     2          7         $0400 + 2*$28 + 7*$80        $07D0          2000
+```
+
+Two observations worth calling out explicitly:
+
+**Visually adjacent rows are far apart in memory; visually distant rows are close together.** Row 0 is at `$0400` and row 1 is at `$0480` -- 128 bytes apart even though they are one scanline apart on the screen. Meanwhile row 8 at `$0428` is only 40 bytes after row 0 at `$0400` -- they are neighbors in the memory listing but eight scanlines apart on the display. A simple `base + row * 40` loop would put every row after the first in the wrong place.
+
+**The three groups of 8 rows leave "screen holes" that peripheral cards use as scratch.** 24 divides evenly into three groups of 8, and the group stride `$28` (40 bytes) is exactly one row width. The entire 24-row screen fits within `$0400`-`$07F7` with a handful of unused bytes at the ends of certain rows (`$0478`-`$047F`, `$04F8`-`$04FF`, etc.) that the original hardware repurposed as scratch space for peripheral cards.
+
+**The hardware reason in one paragraph**: the Apple II's video scanner generates memory addresses directly from the horizontal and vertical counters using bit-level wiring, not multiplication. Specific address bits -- particularly A7 and A9 -- are driven by the vertical counter with a staggered pattern, while A0-A6 are driven by the horizontal column counter. Woz chose the bit mapping that required the fewest 7400-series logic chips. Multiplication would have required a real ALU; bit-wiring required half a 74LS chip. The interleave is the shadow that design choice casts across every programmer who has ever touched the Apple II screen. Applesoft BASIC and the monitor ROM both carry a hardcoded row-address table because computing the formula on every character access would be too slow at 1 MHz.
+
+### Real-World Analogy
+
+> Imagine a theater where Row 1 is at the front, Row 2 is behind the balcony, Row 3 is backstage, Row 4 is up a ladder, Row 5 is on the roof, and Row 6 is in the lobby. You cannot walk in and count rows by number -- you need a seat map. The Apple II screen memory is laid out the same way: you cannot loop `addr = start + row*40`. You need a lookup. The `textRowAddr` function IS that seat map, compressed into three arithmetic operations. The hardware engineer who designed this seating chart was not a sadist; he was trying to save parts. Every chip he did not put on the motherboard shaved cost off the list price, and in 1977 that was the difference between a computer people could afford and a computer only labs could afford.
+
+---
+
+## Section 5: `init()` and the Disassembler Tables (lines 155-350)
+
+### What It Is
+
+```go
+var opNames [256]string
+var opSizes [256]uint8
+
+func init() {
+    for i := range opNames {
+        opNames[i] = "???"
+        opSizes[i] = 1
+    }
+
+    n := func(op byte, name string, size uint8) {
+        opNames[op] = name
+        opSizes[op] = size
+    }
+
+    // Load/Store
+    n(0xA9, "LDA", 2)
+    n(0xA5, "LDA", 2)
+    // ... (151 entries across 13 instruction groups)
+    n(0xEA, "NOP", 1)
+    n(0x00, "BRK", 1)
+}
+```
+
+### Why It Matters
+
+The trace loop in `main()` needs two pieces of information for every opcode it encounters:
+1. A human-readable mnemonic (`LDA`, `JMP`, `BNE`, etc.).
+2. How many bytes the instruction occupies, so the raw-bytes column of the trace shows exactly 1, 2, or 3 bytes correctly.
+
+A static 256-entry array is the simplest, fastest possible answer: O(1) lookup, no hash, no function call, trivial to audit.
+
+### How the Code Works
+
+**The package-level arrays**: `[256]string` and `[256]uint8`. The fixed size of 256 matches the opcode space exactly -- a byte has exactly 256 possible values, so one array entry per possible opcode. These are arrays (fixed-size, value type), not slices (dynamic). The size is known at compile time and never changes. Go zero-initializes arrays: `opNames` starts with all empty strings, `opSizes` starts with all zeros. Both get overwritten by `init()`.
+
+**Go's `init()` mechanism**: any function in a Go package named `init()` with no parameters and no return value is a package initializer. The Go runtime runs all `init()` functions in a package before `main()` begins, exactly once, automatically. You cannot call `init()` manually; it is not an ordinary function. A package can have multiple `init()` functions spread across multiple source files, and they run in the order the files are compiled (roughly alphabetical). The `init()` mechanism exists precisely for cases like this one: setting up package-level state that cannot be expressed as a simple variable initializer because it requires a loop or conditional logic.
+
+**The default-fill loop**: before filling known opcodes, `init()` writes `"???"` into every slot and size `1` into every slot. This default matters in two ways. Any unknown or illegal opcode prints as `???` -- a clear signal in the trace that something unexpected is executing. Default size `1` is the safest fallback: it ensures the trace loop does not accidentally consume operand bytes from the next instruction when it encounters an unknown opcode.
+
+**The `n` closure**: this is the most elegant line in the file. `n := func(op byte, name string, size uint8) { opNames[op] = name; opSizes[op] = size }` creates a local function and binds it to the name `n`. The closure captures `opNames` and `opSizes` from the enclosing `init()` scope -- it can read and write those arrays directly. Instead of writing two array assignments per opcode (`opNames[0xA9] = "LDA"` and `opSizes[0xA9] = 2`), every entry becomes a single compact call (`n(0xA9, "LDA", 2)`). The closure exists only for the duration of `init()` and goes out of scope when `init()` returns. This is the DRY principle at its simplest: define the repetitive action once, then call it.
+
+**Instruction groups**: the 151 entries are organized into 13 groups following the traditional 6502 instruction reference grouping: Load/Store, Transfers, Stack, Arithmetic, Logic, Shift/Rotate, Inc/Dec, Compare, Bit, Branches, Jump, Flags, and Misc. This mirrors the layout of a 6502 reference card. To audit the table, open a 6502 reference next to the file and check each group sequentially.
+
+**The LDA group as a worked example**: LDA alone has 8 entries because there are 8 addressing modes that can load the accumulator, each with a different opcode byte:
+
+```go
+n(0xA9, "LDA", 2) // LDA immediate    -- 2 bytes: opcode + immediate value
+n(0xA5, "LDA", 2) // LDA zero page    -- 2 bytes: opcode + zero page address
+n(0xB5, "LDA", 2) // LDA zero page,X  -- 2 bytes: opcode + zero page address
+n(0xAD, "LDA", 3) // LDA absolute     -- 3 bytes: opcode + lo byte + hi byte
+n(0xBD, "LDA", 3) // LDA absolute,X   -- 3 bytes
+n(0xB9, "LDA", 3) // LDA absolute,Y   -- 3 bytes
+n(0xA1, "LDA", 2) // LDA (zp,X)       -- 2 bytes: opcode + zero page address
+n(0xB1, "LDA", 2) // LDA (zp),Y       -- 2 bytes: opcode + zero page address
+```
+
+Same mnemonic, 8 different opcodes, two different lengths. The 6502 instruction set has this quality throughout -- the same operation encoded with different addressing modes produces different opcode bytes and sometimes different operand lengths. The table stores only what the trace loop needs: the mnemonic string and the total byte count.
+
+**Coverage**: 151 of 256 possible opcode slots are filled. The remaining 105 slots are either unused holes in the 6502 instruction set or "illegal" (undocumented) opcodes that the Apple II+ ROM firmware never executes. Any `???` in the trace output is a strong signal that something has gone wrong -- the CPU is either reading from uninitialized RAM or executing code at a wrong address.
+
+**Why arrays instead of a map**: a `map[byte]string` would also work, but it has higher overhead: hash computation, memory allocation, and a `, ok` check pattern to distinguish "unknown opcode" from "key not present." A 256-entry fixed array is O(1), bounds-checked by the compiler for compile-time constants, and zero-cost to access after initialization. For a table this small with constant access patterns, the array is unambiguously the right choice.
+
+**Important scope note**: the disassembler deliberately does NOT decode addressing modes or format operand values. A full disassembler would recognize opcode `$A9` as `LDA immediate` and format the following byte as `#$42`, or recognize `$AD` as `LDA absolute` and format the next two bytes as `$1234`. Our table stores only the mnemonic and the raw length. The trace loop prints the raw operand bytes separately. This is a phase-3 choice: the output is readable enough for a developer debugging a boot sequence, and the table is simple enough to verify in five minutes.
+
+### Real-World Analogy
+
+> The disassembler table is a traveler's pocket phrasebook. It does not teach grammar or conjugation; it gives you just enough to get by -- "hello," "thank you," "where is the train." When you see `$A9 42` flash by in the trace, the phrasebook does not translate it into "load the accumulator with the immediate value 66 decimal"; it just says `LDA` and shows you the raw bytes. You recognize the pattern, you check the reference card if you need more, and you move on. A full disassembler would be a dictionary and a grammar textbook. This is a phrasebook, and phrasebooks fit in a pocket.
+
+---
+
+## Section 6: Putting It Together -- The Phase 3 Boot Flow
+
+We have walked every line; now let us watch the file run from the first shell keystroke to the exit code.
+
+### Boot Timeline (Diagram 5)
+
+```
+  Step   Actor           Action                                    Effect
+  ----   -------------   ---------------------------------------   ----------------------------------
+    1    Go runtime      init() runs (from Section 5)             opNames / opSizes tables filled
+    2    Go runtime      main() begins
+    3    main            flag.Parse()                              romPath, traceCount set
+    4    main            loadROM("roms/apple2plus.rom")            rom built, Base = $D000
+    5    main            memory.NewRAM()                           64 KB zeroed RAM created
+    6    main            appleio.NewSoftSwitches()                 sw created, TextMode = true
+    7    main            bus.New()                                 empty bus b created
+    8    main            b.Map($0000, $BFFF, ram)                  base RAM layer
+    9    main            b.Map($C000, $C0FF, sw)                   softswitch overlay
+   10    main            b.Map($D000, $FFFF, rom)                  ROM overlay
+   11    main            b.Dump()                                  bus map printed to stdout
+   12    main            cpu.NewCPU(b)                             CPU wired to bus
+   13    main            c.Reset()                                 PC = *$FFFC (e.g. $FF59)
+   14    main            print reset vector                        diagnostic print
+   15    main            enter trace loop
+   16    CPU             Step() x N                                hundreds of instructions traced
+   17    main            detects PC == prevPC three times          prints stuck message, breaks
+   18    main            prints final register state               post-mortem dump
+   19    main            prints first 3 text-screen rows           raw hex preview
+   20    Go runtime      main() returns                            exit code 0
+```
+
+### Forward Pointer Roundup
+
+Every previous walkthrough in this series contained a forward pointer to `main.go`. Here is where each one lands:
+
+- **Memory walkthrough, "How the Bus Stacks These"**: closed by the three `b.Map` calls in sub-section 2d. The "stacking" is the layer-by-layer registration of RAM, then softswitches, then ROM -- each call adding one more device to the scan list.
+
+- **Bus walkthrough, "the bus only becomes useful when main.go wires it up"**: closed by the entirety of sub-section 2d. The bus was described as an empty router; here is where it acquires its three devices and becomes a functioning address space.
+
+- **Bus walkthrough Section 7 (Dump)**: closed by sub-section 2e. `b.Dump()` runs right after the three Map calls and prints the assembled memory map before the first instruction executes.
+
+- **Bus walkthrough Section 8 (Putting It Together)**: closed by sub-section 2d's description of how last-match-wins overlay order is determined by Map call sequence.
+
+- **I/O walkthrough, "main.go is the wiring diagram"**: closed by the `b.Map(0xC000, 0xC0FF, sw)` line -- the moment the softswitch window joins the bus and reads in that region start triggering hardware state changes.
+
+- **I/O walkthrough Section 6 (Putting It Together, bus call chain)**: closed by sub-section 2d's walkthrough of how the bus routes reads at `$C000`-`$C0FF` to the softswitch block instead of RAM.
+
+- **CPU walkthrough Section 5 (New and Reset)**: closed by `c.Reset()` and the reset-vector print in sub-section 2f. The CPU walkthrough described what `Reset` does; here is the call site.
+
+- **CPU walkthrough Section 6 (Step, fetch-decode-execute)**: closed by `c.Step()` inside the trace loop in sub-section 2g. The CPU walkthrough described the entire execution cycle; here is where it runs against a real ROM.
+
+- **cpu_test walkthrough (Klaus Dormann trap detection)**: closed by the stuck-loop detector in sub-section 2g. The same "if PC did not move, we are stuck" pattern used in the test harness to detect the Klaus Dormann test ROM's final idle loop appears here as the production emulator's safety valve.
+
+---
+
+## Section 7: Design Decisions and Phase 3 Trade-offs
+
+**Q1: Why does `main.go` have a trace loop instead of a real interactive REPL?**
+
+Phase 3 is focused on boot correctness, not interactivity. A trace of the first 200-500 instructions answers the questions a developer actually has at this stage: does the ROM start? does the monitor initialize? does the text screen get cleared? A "running..." display would hide all of that behind a blank screen. Interactive keyboard input and a real video renderer belong to phase 4; they require a frame loop, a host-side input source, an event model, and a plan for pacing the CPU against wall-clock time. Phase 3 deliberately skips all of that complexity and gives you something you can read and reason about: a timestamped execution trace.
+
+**Q2: Why is the text screen previewed via direct `ram.Data[base+col]` instead of `b.Read`?**
+
+Both would work and produce identical results. Direct access skips the bus scan, which is marginally faster and slightly more self-documenting in context: after the CPU has stopped executing, nothing can overlay or change the RAM contents, so going straight to the backing store is reasonable. Using `b.Read(base + uint16(col))` would be equally valid and arguably more consistent in spirit -- it routes the read through the same path the CPU uses. The direct access is a style preference, not a correctness requirement. Either way, you read the same bytes.
+
+**Q3: Why alias `io` to `appleio` instead of importing it with its natural name?**
+
+Go's standard library has a package named `io` -- it defines `Reader`, `Writer`, and other stream interfaces that appear constantly in Go code. Even though `main.go` does not currently import stdlib `io`, any future code that adds it would collide with our `github.com/apple2emu/io` if both used the natural short name `io`. Aliasing our package as `appleio` lets both coexist forever. It is a one-line defensive move at the import site that costs nothing and eliminates an entire category of future refactoring pain.
+
+**Q4: Why does the trace loop peek at `pc+1` and `pc+2` bytes that might not be part of the current instruction?**
+
+**There is one honest gotcha lurking here**: reads in the softswitch window `$C000`-`$C0FF` (49,152-49,407) have side effects. If PC ever pointed into that region and we peeked at `pc+1` or `pc+2`, those peeks could trigger softswitch state changes -- for example, advancing the keystrobe, toggling a graphics mode. Cross-reference the I/O walkthrough Section 3 (Read with side effects) for the full mechanism. A phase-4 rewrite of the trace loop might want a "read without side effects" helper, or at least a bounds check on PC before issuing peeks.
+
+In the common case the peek is safe, which is why phase 3 gets away with it: reads from RAM and ROM have no side effects, and the `size`-guarded `switch` ensures the peeked bytes are only printed when they genuinely belong to the instruction. A 1-byte instruction reads but ignores `b1` and `b2`. In normal Apple II boot execution, PC lives in ROM (`$D000`-`$FFFF`) or RAM (`$0000`-`$BFFF`), never in the I/O window -- so the hazard never actually fires during a typical boot trace. Calling it out honestly is cheaper than burying it.
+
+**Q5: Why print the reset vector manually with `b.Read($FFFC) | b.Read($FFFD)<<8` instead of just printing `c.PC` after `Reset()`?**
+
+`c.PC` already holds the correct address after `c.Reset()` and would be cheaper to print. The manual read-and-assemble serves a pedagogical purpose: the trace output explicitly shows the two bytes at `$FFFC`/`$FFFD`, which reminds the reader of the reset-vector convention. Anyone reading a saved trace can see both the raw bytes and the assembled address in one line of output, without needing to look them up separately. It is a diagnostic choice, not a correctness requirement.
+
+**Q6: Why is the stuck-loop threshold 3 instead of 1?**
+
+A single same-PC-twice observation could fire on a legitimate branch sequence that briefly revisits an address -- unusual but not impossible in tight initialization loops. Requiring three consecutive same-PC observations is a low-cost safety margin. Almost no real code executes at the same PC three times in a row unless it is genuinely spinning. The Klaus Dormann test harness uses the same basic idea with a similarly conservative threshold. Three was enough to avoid false positives in early testing of this emulator; if a future ROM shows a false positive at 3, bumping to 4 or 5 is a one-character edit.
+
+---
+
+## Section 8: Summary and Phase Roadmap
+
+`main.go` at phase 3 is a 350-line bootstrap harness. It parses two flags, loads a ROM with automatic size detection, wires RAM, softswitches, and ROM onto a bus in an order that makes last-match-wins do the right thing, boots a CPU against the bus, reads the reset vector, and traces up to 200 instructions while disassembling each one and watching for JMP-to-self stuck loops. When the trace ends -- by count or by detection -- it prints the final register state and a raw hex preview of the first three text-screen rows, then exits. Every promise the previous walkthroughs made about how the pieces would come together lands in this one file.
+
+> `main.go` is the smallest file in the project that actually decides anything. Everything else is a reusable component -- `cpu.CPU`, `memory.RAM`, `memory.ROM`, `bus.Bus`, `io.SoftSwitches` -- each of which could be lifted out and dropped into a different emulator. `main.go` is the one file where the emulator takes a position. It says: "this is an Apple II+, with a 12 KB ROM at `$D000`, a softswitch window at `$C000`, 48 KB of RAM, and a trace-driven boot harness." Change `main.go` and you change which machine you are emulating. Leave the rest alone.
+
+### Phase 3 vs Future Phases (Diagram 6)
+
+```
+  Feature                          Phase 3                Future phases
+  -------------------------------  ---------------------  ----------------------------------
+  Flag parsing                     yes                    yes (more flags)
+  ROM loading with size detection  yes                    yes
+  Bus wiring                       three Map calls        add slot ROMs, language card
+  CPU trace with disassembly       yes (151 opcodes)      optional debug tool only
+  Stuck-loop detection             yes                    yes (keep as safety valve)
+  Text screen raw hex preview      yes                    replaced by real renderer
+  Interactive keyboard loop        no                     yes (terminal raw mode or SDL)
+  Video renderer                   no                     yes (text + lores + hires + page 2)
+  Audio output                     no                     yes (speaker toggle -> PCM)
+  Disk II slot 6                   no                     yes (WOZ or DSK images)
+  Bank switching / language card   no                     yes (via bus overlays)
+  Save/load state                  no                     maybe
+  TUI or GUI frontend              no                     maybe
+```
+
+### What's Next
+
+With `main.go` walked, the core-code walkthrough series is complete. Future walkthroughs could cover the bus and io test files, or the series could pause here until phase 4 adds enough new code to warrant a new chapter.

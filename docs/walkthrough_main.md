@@ -1,728 +1,1476 @@
-# Educational Walkthrough: `main.go` -- The Phase 3 Boot Harness
+# Educational Walkthrough: `main.go` -- The Phase 4 SDL Interactive Emulator
 
-> This is the finale of the emulator walkthrough series. You have already seen the CPU, memory, bus, and I/O softswitches in isolation. `main.go` is where those components meet -- where a command-line flag becomes a loaded ROM, a ROM becomes a mapped device, a device becomes a booted CPU, and a booted CPU becomes a trace of real 6502 instructions running the Apple II monitor firmware. The file is intentionally small: at phase 3, it is a bootstrap harness, not a finished emulator. By the end of this walkthrough you will be able to read every line, explain every design choice, and see exactly which forward references from the previous walkthroughs land here.
-
----
-
-## Section 0: Background -- What `main.go` Does at Phase 3
-
-You have read five walkthroughs in this series. Each one described a component in isolation:
-
-- **`walkthrough_cpu_go.md`** -- the MOS 6502 CPU: registers, flags, addressing modes, the fetch-decode-execute loop.
-- **`walkthrough_cpu_test_go.md`** -- the Klaus Dormann test suite: how we verify the CPU against a complete 6502 functional test ROM.
-- **`walkthrough_memory.md`** -- RAM and ROM: how 64 KB of byte storage is divided into pages, how `LoadROM` maps a binary file to a base address, how ROM blocks writes.
-- **`walkthrough_bus.md`** -- the bus router: how `Map` registers devices, how `Read`/`Write` scan from the tail to implement last-match-wins overlays, how `Dump` prints the map, what open-bus fallback means.
-- **`walkthrough_io.md`** -- softswitches: how memory-mapped I/O works on the Apple II, how a read at `$C054` (49,236) is itself a video-mode command, and how the softswitch block plugs into the bus.
-
-Every one of those walkthroughs ended with a forward pointer: "this piece becomes useful when `main.go` wires it together." The I/O walkthrough stated it plainly: "the finale walkthrough will be `main.go`, which is the wiring diagram tying CPU, bus, RAM, ROM, and softswitches into a runnable machine."
-
-This is the wiring diagram. It is where the separate components become a machine.
-
-### What Phase 3 Includes and Does Not Include
-
-**Phase 3 includes:** command-line flag parsing, ROM loading with automatic size detection, RAM construction, softswitch construction, bus construction, three `Map` calls that assemble the Apple II+ memory layout, a bus map dump to stdout, CPU construction and reset, manual reset-vector readout, an instruction trace loop with inline disassembly, a stuck-loop detector, a post-mortem register dump, and a raw hex preview of the first three text-screen rows.
-
-**Phase 3 does not include:** an interactive keyboard input loop (that belongs to phase 4), real video rendering (a text or graphics renderer comes later), audio output (speaker-toggle to PCM conversion is a later concern), Disk II slot 6 (phase 4+ with WOZ or DSK images), bank switching and the language card (a later bus rework), save/load state, or any kind of TUI or GUI frontend. Phase 3 is the smallest `main` that actually boots a real Apple II+ ROM and produces meaningful output. That is not a limitation -- it is a deliberate decision to verify correctness before adding complexity.
-
-### Top-Level Architecture (Diagram 1)
-
-```
-  command line                       +-----------------+
-  -rom foo.rom  ------> flag.Parse   | romPath string  |
-  -trace 200                         | traceCount int  |
-                                     +--------+--------+
-                                              |
-                                              v
-                                       +-------------+
-                                       |  loadROM()  |
-                                       +------+------+
-                                              |
-                                              v
-                       +----------+   +----------------+   +-------------+
-                       | NewRAM() |   |NewSoftSwitches()|  | *memory.ROM |
-                       +----+-----+   +------+---------+  +------+------+
-                            |                |                   |
-                            v                v                   v
-                         +--+----------------+-------------------+--+
-                         |                 bus.New()                 |
-                         |   b.Map($0000,$BFFF, ram)                 |
-                         |   b.Map($C000,$C0FF, sw)                  |
-                         |   b.Map(rom.Base, rom.End(), rom)         |
-                         +-----------------+-------------------------+
-                                           |
-                                           v
-                                     cpu.NewCPU(b)
-                                           |
-                                           v
-                                       c.Reset()
-                                           |
-                                           v
-                         +-----------------+------------------+
-                         |     trace loop: c.Step() x N       |
-                         |  disassemble opcode, print regs    |
-                         |  detect JMP-to-self stuck loop     |
-                         +-----------------+------------------+
-                                           |
-                                           v
-                           post-mortem: final state + text page preview
-                                           |
-                                           v
-                                         exit(0)
-```
-
-The rest of this walkthrough walks the code top to bottom, but if you ever get lost, scroll back to the diagram above.
+> This is the new finale of the emulator walkthrough series. You have
+> already seen the CPU execute 6502 instructions, RAM and ROM hold bytes, a
+> bus router dispatch reads and writes, softswitches translate memory
+> accesses into hardware commands, a character generator decode screen bytes
+> into dot patterns, and a video renderer convert those patterns into an
+> RGBA pixel buffer. `main.go` is where all those parts run simultaneously
+> -- where a command-line flag becomes a loaded ROM, a ROM becomes a mapped
+> device, a device becomes a booted CPU, a booted CPU drives a text screen,
+> and that text screen appears in a real window at 60 frames per second.
+> Phase 4 is not a diagnostic harness. It is an interactive emulator.
 
 ---
 
-## Section 1: Package and Imports (lines 1-12)
+## Section 0: Background -- What `main.go` Does at Phase 4
 
-### What It Is
+You have read seven walkthroughs in this series. Each one described a
+package in isolation:
+
+- **`walkthrough_cpu_go.md`** -- the MOS 6502 CPU: registers, flags,
+  addressing modes, the fetch-decode-execute loop, and how `Step()` returns
+  a cycle count.
+- **`walkthrough_cpu_test_go.md`** -- the Klaus Dormann functional test
+  suite: how we verify the CPU against a 65K-instruction ROM that exercises
+  every opcode, mode, and flag.
+- **`walkthrough_memory.md`** -- RAM and ROM: how 64 KB of byte storage is
+  divided into pages, how `LoadROM` maps a binary file to a base address,
+  and how ROM blocks writes while passing reads through.
+- **`walkthrough_bus.md`** -- the bus router: how `Map` registers address
+  regions, how `Read`/`Write` dispatch to the right device, how last-match-
+  wins overlays work, and what open-bus fallback means.
+- **`walkthrough_io.md`** -- softswitches: how memory-mapped I/O works on
+  the Apple II, how a read at `$C054` (49,236) is itself a video-mode
+  command, and how the softswitch block plugs into the bus.
+- **`walkthrough_chargen.md`** -- the character generator ROM: how 7x8 dot
+  patterns are stored, how the character code byte maps to a row address,
+  and how the flash bit works.
+- **`walkthrough_video.md`** -- the video renderer: how the 40-column text
+  screen lives in RAM at `$0400`-`$07FF` (1,024-2,047), how each character
+  code maps to pixels via the character generator, and how an RGBA32 pixel
+  buffer is produced for SDL2.
+
+Every one of those walkthroughs ended with a forward pointer: "this piece
+becomes useful when `main.go` wires it together." This is where they
+converge.
+
+### This Walkthrough Replaces `walkthrough_main_phase3.md`
+
+This document **replaces** `walkthrough_main_phase3.md`, which covered the
+Phase 3 trace harness -- a command-line tool that loaded a ROM, booted the
+CPU, and printed a disassembly trace to stdout. Phase 3 was a diagnostic
+tool; Phase 4 is an interactive emulator. `walkthrough_main_phase3.md`
+remains as a historical document; it is referenced here wherever Phase 3
+details are still relevant (flag parsing, `loadROM`, import structure).
+
+### What Phase 4 Includes
+
+- An SDL2 window (840x576) displaying the Apple II text screen at 3x native
+resolution
+- A 60fps render loop that times itself against `1.023 MHz / 60 = 17,050
+cycles per frame`
+- Keyboard input: SDL key events translated to Apple II key codes and
+delivered to the softswitch layer
+- Video rendering via `video.NewVideo(ram.Data[:])` and `vid.RenderText()`
+each frame
+- A live FPS counter displayed in the window title bar
+- VSync via `sdl.RENDERER_PRESENTVSYNC` with a manual `sdl.Delay()` fallback
+- ROM auto-detection: 12 KB maps to `$D000` (53,248), 16 KB maps to `$C000`
+(49,152)
+
+### What Phase 4 Removed from Phase 3
+
+- `textRowAddr` lookup table (moved to `video.go` as `textLineAddr`)
+- The inline disassembler opcode tables (`opNames`, `opSizes`) and the
+`init()` function that populated them
+- The CPU trace loop (the per-instruction `fmt.Printf` output)
+- The stuck-loop detector (three consecutive `c.PC == prevPC` checks)
+- The post-mortem register dump
+- The hex screen preview (`b.Read` loop over first three text rows)
+- The `--trace` flag and `traceCount` variable
+- The `b.Dump()` call (Phase 4 is a GUI application; bus-map printing
+belongs in debugging tools)
+
+### What Phase 4 Does Not Yet Include
+
+Phase 4 is feature-complete for text-mode Apple II interaction but is not a
+full emulator. Still missing:
+
+- Audio output (speaker-toggle `$C030` to PCM waveform conversion)
+- Lo-res graphics mode (GR) -- reinterpreting `$0400`-`$07FF` bytes as 40x48
+color blocks
+- Hi-res graphics mode (HGR) -- a separate renderer for the `$2000`-`$3FFF`
+(8,192-16,383) bitmap area
+- Disk II slot 6 support for loading software from `.dsk` or `.woz` images
+- Bank switching and the language card (remapping ROM region to writable RAM)
+- Save and load state
+
+### Full Source Code
 
 ```go
 package main
 
 import (
-    "flag"
-    "fmt"
-    "os"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+	"unsafe"
 
-    "github.com/apple2emu/bus"
-    "github.com/apple2emu/cpu"
-    appleio "github.com/apple2emu/io"
-    "github.com/apple2emu/memory"
+	"github.com/veandco/go-sdl2/sdl"
+
+	"github.com/apple2emu/bus"
+	"github.com/apple2emu/cpu"
+	appleio "github.com/apple2emu/io"
+	"github.com/apple2emu/memory"
+	"github.com/apple2emu/video"
 )
-```
 
-### Why It Matters
+const (
+	// Apple II runs at 1.023 MHz, display refreshes at ~60 Hz.
+	cpuClock       = 1023000
+	targetFPS      = 60
+	cyclesPerFrame = cpuClock / targetFPS // ~17050
 
-`package main` is what makes this file the entry point of an executable. A Go source file declaring any other package name -- even with a `func main()` inside -- will not build as a runnable command. This declaration is the contract with the Go toolchain.
+	// Window size: 3x native resolution for visibility.
+	windowScale = 3
+	windowW     = video.ScreenW * windowScale // 840
+	windowH     = video.ScreenH * windowScale // 576
+)
 
-The import list is a dependency map. Seven lines tell you everything `main.go` needs from the outside world: three standard library packages and four internal packages. If you had never seen this file before, the import block alone would tell you the story: "this program parses arguments, writes to stdout/stderr, reads files, uses a bus, a CPU, an I/O layer, and memory."
+func main() {
+	romPath := flag.String("rom", "roms/Apple2_Plus.rom", "Path to Apple II ROM image (12 KB or 16 KB)")
+	flag.Parse()
 
-### How the Code Works
+	// --- Load ROM -----------------------------------------------------------
+	rom, err := loadROM(*romPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+		fmt.Fprintln(os.Stderr, "Place an Apple II ROM in the roms/ directory:")
+		fmt.Fprintln(os.Stderr, "  mkdir -p roms")
+		fmt.Fprintln(os.Stderr, "  cp /path/to/Apple2_Plus.rom roms/")
+		os.Exit(1)
+	}
 
-**`package main`**: Go's single convention for executables. Every Go program that compiles to a binary has exactly one `package main` across the entire project, with exactly one `func main()` inside it.
+	// --- Wire the bus -------------------------------------------------------
+	ram := memory.NewRAM()
+	sw := appleio.NewSoftSwitches()
+	b := bus.NewBus()
 
-**Standard library imports**:
-- `flag` -- Go's built-in command-line argument parser. We will see it in detail in sub-section 2a.
-- `fmt` -- formatted I/O, essentially `printf` and `println` for Go. Used throughout the file for trace output and diagnostics.
-- `os` -- operating system interface: file stat, file read, stderr handle, exit codes. Used in `loadROM` and in the error handler.
+	b.Map(0x0000, 0xBFFF, ram)
+	b.Map(0xC000, 0xC0FF, sw)
+	b.Map(rom.Base, rom.End(), rom)
 
-**Go module paths** (`github.com/apple2emu/...`): Go modules use an import path as a unique identifier for the project and its packages. The URL-like prefix `github.com/apple2emu` is a convention, not a requirement that a real GitHub repository exist at that address. The `go.mod` file at the project root declares this module name, and every Go file inside the project uses paths prefixed with that name to import sibling packages. Think of `github.com/apple2emu` as the project's namespace, not a website.
+	fmt.Printf("Apple II Emulator -- Iteration 3\n")
+	fmt.Printf("ROM: %s (%d bytes at $%04X-$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
 
-**Aliased import** (`appleio "github.com/apple2emu/io"`): this is the most interesting line in the import block, and it is worth understanding fully. Go's standard library has a package named `io` -- it defines `Reader`, `Writer`, and other stream interfaces used throughout Go programming. Our emulator also has a package named `io` at `github.com/apple2emu/io`. If both were imported with their natural short names, the compiler would see two different packages both called `io` and refuse to build.
+	// --- Init CPU -----------------------------------------------------------
+	c := cpu.NewCPU(b)
+	c.Reset()
+	fmt.Printf("Reset vector: $%04X\n", c.PC)
 
-Even though `main.go` does not currently import stdlib `io`, aliasing our emulator's I/O package as `appleio` removes the collision landmine permanently. Any future developer who wants to add `"io"` to the import list can do so without renaming every call site. The result shows up throughout the file: `appleio.NewSoftSwitches()` instead of `io.NewSoftSwitches()`. The alias appears on the left of the quoted path and becomes the identifier used in code.
+	// --- Init video ---------------------------------------------------------
+	vid := video.NewVideo(ram.Data[:])
 
-### Real-World Analogy
+	// --- Init SDL2 ----------------------------------------------------------
+	if err := sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS)); err != nil {
+		fmt.Fprintf(os.Stderr, "SDL init failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer sdl.Quit()
 
-> The import list is a staff directory for an office building. It tells you who lives in which suite, so when you need to route a task -- "please format this number," "please read that file," "please give me a fresh softswitch bank" -- you know exactly where to knock. Aliasing `io` to `appleio` is like having two employees named Alex: before they ever meet, you give one of them a badge that says "Apple-Alex" so nobody gets confused at the coffee machine.
+	window, err := sdl.CreateWindow(
+		"Apple II Emulator",
+		sdl.WINDOWPOS_CENTERED, sdl.WINDOWPOS_CENTERED,
+		int32(windowW), int32(windowH),
+		sdl.WINDOW_SHOWN,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Create window failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer window.Destroy()
 
----
+	renderer, err := sdl.CreateRenderer(window, -1,
+		sdl.RENDERER_ACCELERATED|sdl.RENDERER_PRESENTVSYNC)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Create renderer failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer renderer.Destroy()
 
-## Section 2: `main()` -- The Entry Point (lines 14-124)
+	// Nearest-neighbor scaling for crisp pixels.
+	sdl.SetHint(sdl.HINT_RENDER_SCALE_QUALITY, "0")
 
-The body of `main()` reads linearly from top to bottom as six phases, separated in the source by `// ---` comment rules. We will walk each phase in turn, and each phase is small enough to hold in your head all at once.
+	texture, err := renderer.CreateTexture(
+		uint32(sdl.PIXELFORMAT_RGBA32),
+		sdl.TEXTUREACCESS_STREAMING,
+		int32(video.ScreenW), int32(video.ScreenH),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Create texture failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer texture.Destroy()
 
-### Sub-section 2a: Flag Parsing
+	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
 
-```go
-romPath := flag.String("rom", "roms/apple2plus.rom", "Path to Apple II ROM image")
-traceCount := flag.Int("trace", 200, "Number of instructions to trace (0 = run until loop)")
-flag.Parse()
-```
+	// --- Main loop ----------------------------------------------------------
+	running := true
+	frameCount := 0
+	fpsTimer := time.Now()
 
-Go's `flag` package is the standard library's answer to command-line argument parsing. Each call to `flag.String` or `flag.Int` registers a named flag and returns a pointer -- `*string` or `*int` respectively. The pointer is important: at the time `flag.String` runs, no command-line parsing has happened yet. The returned pointer is a handle you can read AFTER `flag.Parse()` does the actual work. If `flag.String` returned a plain `string`, that string would be frozen at the default value with no way to update it when the user passes a different value.
+	for running {
+		frameStart := time.Now()
 
-`flag.Parse()` walks `os.Args` (the raw command-line arguments), matches each `-name value` pair against the registered flags, and populates the variables through their pointers. After this line, `*romPath` dereferences the pointer to read the actual ROM path, and `*traceCount` gives the trace limit.
+		// 1. Poll SDL events (keyboard, quit)
+		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+			switch e := event.(type) {
+			case *sdl.QuitEvent:
+				running = false
 
-A practical example:
+			case *sdl.KeyboardEvent:
+				if e.Type == sdl.KEYDOWN {
+					if key := sdlKeyToApple(e); key != 0 {
+						sw.PressKey(key)
+					}
+					// Escape to quit
+					if e.Keysym.Sym == sdl.K_ESCAPE {
+						running = false
+					}
+					// Ctrl+R to reset
+					if e.Keysym.Sym == sdl.K_r && e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
+						c.Reset()
+					}
+				}
+			}
+		}
 
-```
-$ ./apple2emu -rom roms/apple2plus.rom -trace 500
-```
+		// 2. Run CPU for one frame's worth of cycles
+		for cycles := 0; cycles < cyclesPerFrame; {
+			cycles += c.Step()
+		}
 
-`flag.Parse` sees `-rom roms/apple2plus.rom`: it matches the "rom" registration, stores `"roms/apple2plus.rom"` in the backing string, and `*romPath` reads `"roms/apple2plus.rom"`. It then sees `-trace 500`: it matches the "trace" registration, parses the integer 500, and `*traceCount` reads `500`.
+		// 3. Render the screen
+		vid.RenderText()
 
-One free side effect: running `./apple2emu -h` prints each registered flag with its default value and help text automatically. The flag package generates that usage output from the three arguments you already passed to `flag.String` and `flag.Int`.
+		// 4. Upload pixel buffer to SDL texture and present
+		texture.Update(nil, unsafe.Pointer(&vid.Pixels[0]), int(video.ScreenW)*4)
+		renderer.Clear()
+		renderer.Copy(texture, nil, nil)
+		renderer.Present()
 
-### Sub-section 2b: `loadROM` Call and the Helpful Error Message
+		// 5. FPS counter in title bar
+		frameCount++
+		if time.Since(fpsTimer) >= time.Second {
+			window.SetTitle(fmt.Sprintf("Apple II Emulator -- %d fps", frameCount))
+			frameCount = 0
+			fpsTimer = time.Now()
+		}
 
-```go
-rom, err := loadROM(*romPath)
-if err != nil {
-    fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
-    fmt.Fprintln(os.Stderr, "To get started, place an Apple II+ ROM in the roms/ directory:")
-    fmt.Fprintln(os.Stderr, "  mkdir -p roms")
-    fmt.Fprintln(os.Stderr, "  cp /path/to/apple2plus.rom roms/")
-    fmt.Fprintln(os.Stderr, "")
-    fmt.Fprintln(os.Stderr, "Common ROM sizes:")
-    fmt.Fprintln(os.Stderr, "  12288 bytes (12 KB) — standard Apple II+ ROM ($D000–$FFFF)")
-    fmt.Fprintln(os.Stderr, "  16384 bytes (16 KB) — extended dump ($C000–$FFFF)")
-    os.Exit(1)
+		// If vsync isn't working, manually cap to 60 fps
+		elapsed := time.Since(frameStart)
+		target := time.Second / targetFPS
+		if elapsed < target {
+			sdl.Delay(uint32((target - elapsed).Milliseconds()))
+		}
+	}
+}
+
+// sdlKeyToApple converts an SDL keyboard event to an Apple II key code.
+// Returns 0 if the key has no Apple II equivalent.
+func sdlKeyToApple(e *sdl.KeyboardEvent) uint8 {
+	sym := e.Keysym.Sym
+	mod := e.Keysym.Mod
+
+	// Control key combinations
+	if mod&sdl.KMOD_CTRL != 0 {
+		if sym >= sdl.K_a && sym <= sdl.K_z {
+			return uint8(sym-sdl.K_a) + 1 // Ctrl+A=1, Ctrl+B=2, etc.
+		}
+	}
+
+	// Special keys
+	switch sym {
+	case sdl.K_RETURN, sdl.K_KP_ENTER:
+		return 0x0D
+	case sdl.K_BACKSPACE:
+		return 0x08
+	case sdl.K_DELETE:
+		return 0x7F
+	case sdl.K_LEFT:
+		return 0x08
+	case sdl.K_RIGHT:
+		return 0x15
+	case sdl.K_UP:
+		return 0x0B
+	case sdl.K_DOWN:
+		return 0x0A
+	case sdl.K_TAB:
+		return 0x09
+	}
+
+	// Printable ASCII characters
+	if int32(sym) >= 32 && int32(sym) <= 126 {
+		ch := uint8(sym)
+
+		if mod&sdl.KMOD_SHIFT != 0 {
+			if ch >= 'a' && ch <= 'z' {
+				ch -= 32
+			} else {
+				switch ch {
+				case '1':
+					ch = '!'
+				case '2':
+					ch = '@'
+				case '3':
+					ch = '#'
+				case '4':
+					ch = '$'
+				case '5':
+					ch = '%'
+				case '6':
+					ch = '^'
+				case '7':
+					ch = '&'
+				case '8':
+					ch = '*'
+				case '9':
+					ch = '('
+				case '0':
+					ch = ')'
+				case '-':
+					ch = '_'
+				case '=':
+					ch = '+'
+				case '[':
+					ch = '{'
+				case ']':
+					ch = '}'
+				case '\\':
+					ch = '|'
+				case ';':
+					ch = ':'
+				case '\'':
+					ch = '"'
+				case ',':
+					ch = '<'
+				case '.':
+					ch = '>'
+				case '/':
+					ch = '?'
+				case '`':
+					ch = '~'
+				}
+			}
+		} else {
+			// Apple II is uppercase-only -- auto-convert
+			if ch >= 'a' && ch <= 'z' {
+				ch -= 32
+			}
+		}
+		return ch
+	}
+
+	return 0
+}
+
+// loadROM detects the ROM size and sets the correct base address.
+func loadROM(path string) (*memory.ROM, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	size := info.Size()
+	switch size {
+	case 12288:
+		return memory.LoadROM(path, 0xD000)
+	case 16384:
+		return memory.LoadROM(path, 0xC000)
+	default:
+		if size > 0 && size <= 12288 {
+			return memory.LoadROM(path, uint16(0x10000-size))
+		}
+		return nil, fmt.Errorf("unexpected ROM size %d bytes (expected 12288 or 16384)", size)
+	}
 }
 ```
 
-`loadROM(*romPath)` returns `(*memory.ROM, error)`. This is Go's idiomatic multi-return error pattern: the last return value is an `error` interface, which is `nil` on success and carries a message on failure. We check `if err != nil` immediately after any fallible call.
+### Diagram 1: Phase 4 Architecture Overview
 
-On failure, diagnostics go to `os.Stderr`, not `os.Stdout`. This is the Unix convention: stderr is the channel for error output so that `./apple2emu > out.txt` still shows the user the error on their terminal while capturing any successful trace output to a file. `fmt.Fprintln(os.Stderr, ...)` writes a line to stderr; `fmt.Fprintf(os.Stderr, ...)` writes a formatted string.
+```
+  +-------------------------------------------------------------+
+  |                        main.go                              |
+  |                                                             |
+  |  ROM file --> loadROM --> memory.ROM                        |
+  |                                                             |
+  |  memory.NewRAM ----------+                                  |
+  |  appleio.NewSoftSwitches-+-> bus.Map --> bus.Bus --> cpu.CPU|
+  |  memory.ROM -------------+                                  |
+  |                                                             |
+  |  video.NewVideo(ram.Data[:]) --> vid.RenderText()           |
+  |       |                                                     |
+  |       v                                                     |
+  |  SDL2: Init -> Window -> Renderer -> Texture                |
+  |       |                                                     |
+  |       v                                                     |
+  |  Main Loop: [events]->[CPU cycles]->[render]->[present]     |
+  +-------------------------------------------------------------+
+```
 
-The multi-line "how to get started" hint is a deliberate UX choice. Nobody remembers the exact directory to drop the ROM into after being away from the project for a month -- so the error message itself teaches the reader. The binary provides its own onboarding documentation through failure.
+---
 
-`os.Exit(1)`: exits the process with exit code 1. By convention, nonzero exit codes mean "something broke" -- shell scripts and CI pipelines test this value. Note that `os.Exit` is an abrupt stop: it does not run any deferred functions that were registered with `defer`. For a simple harness like this, that is fine.
+## Section 1: Package and Imports (lines 1-17)
 
-### Sub-section 2c: Constructing the Three Devices
+### What It Is
+
+The import block on lines 3-17 lists eleven packages: five from the Go
+standard library (`flag`, `fmt`, `os`, `time`, `unsafe`) and six external to
+the standard library (one external third-party package:
+`github.com/veandco/go-sdl2/sdl`; five internal packages: `bus`, `cpu`, `io`
+aliased as `appleio`, `memory`, `video`).
+
+### Why It Matters
+
+The import block is the dependency manifest of the program. Reading it tells
+you exactly what capabilities `main.go` draws on before you read a single
+line of logic. Compared to Phase 3, two new standard library imports appear
+-- `time` (frame timing and the FPS counter) and `unsafe` (passing a Go
+slice pointer to SDL's C texture upload function) -- and two new package
+dependencies appear: the external `go-sdl2` binding and the internal `video`
+package. The `appleio` alias (line 14) persists from Phase 3 because the
+internal package is named `io`, which would shadow the standard library's
+`io` package if imported without an alias. For the Phase 3 explanation of
+this alias, see walkthrough_main_phase3.md Section 1.
+
+### How the Code Works
+
+Each import serves a specific role:
+
+- **`flag`** (line 4) -- parses the `--rom` command-line argument. Same role
+  as Phase 3.
+- **`fmt`** (line 5) -- formatted printing: startup banner, error messages,
+  FPS counter title.
+- **`os`** (line 6) -- `os.Stat` in `loadROM`, `os.Stderr` for error output,
+  `os.Exit(1)` on fatal errors.
+- **`time`** (line 7) -- **new in Phase 4**: `time.Now()` captures frame
+  start times; `time.Since()` measures elapsed time; `time.Second /
+  targetFPS` computes the 16.67ms target frame duration. Phase 3 had no
+  timing code.
+- **`unsafe`** (line 8) -- **new in Phase 4**: `unsafe.Pointer` converts a
+  Go slice reference to a raw C pointer so SDL's `texture.Update` function
+  (written in C) can read the pixel buffer directly. This is one of the few
+  legitimate uses of the `unsafe` package: the slice is allocated by
+  `make()`, lives for the program's lifetime, and outlives the C call.
+- **`github.com/veandco/go-sdl2/sdl`** (line 10) -- **new in Phase 4**: Go
+  bindings for libSDL2, implemented via CGo (C-Go interoperability). This is
+  not a pure Go library; it calls C functions from the SDL2 dynamic library
+  installed on the system. The CGo layer introduces the type-casting
+  requirement discussed in Sub-section 3e.
+- **`bus`** (line 12) -- the address bus router.
+- **`cpu`** (line 13) -- the MOS 6502 CPU.
+- **`appleio`** (line 14) -- the softswitch I/O block, aliased to avoid
+  shadowing `io`.
+- **`memory`** (line 15) -- RAM and ROM types.
+- **`video`** (line 16) -- **new in Phase 4**: the text-mode video renderer;
+  provides `NewVideo`, `RenderText`, `ScreenW`, `ScreenH`, and the `Pixels`
+  buffer. Not present in Phase 3.
+
+### Real-World Analogy
+
+The import block is the ingredient list for a recipe. Phase 3's list was
+modest: flour, eggs, and butter (text output, flag parsing, file I/O). Phase
+4 adds a display case (`go-sdl2`), a kitchen timer (`time`), and a
+specialized tool for handling raw materials directly (`unsafe`). You cannot
+make the dish without knowing what goes in it.
+
+---
+
+## Section 2: Constants -- Clock, FPS, and Window Geometry (lines 19-29)
+
+### What It Is
+
+The `const` block on lines 19-29 defines six constants that govern the
+emulator's timing and display geometry: `cpuClock`, `targetFPS`,
+`cyclesPerFrame`, `windowScale`, `windowW`, and `windowH`.
+
+### Why It Matters
+
+These six constants encode the fundamental parameters of Apple II emulation.
+They connect three different domains: the 1.023 MHz CPU clock of 1977
+hardware, the 60 Hz NTSC refresh rate that television sets expected, and the
+pixel dimensions of a modern display window. Getting these numbers right
+means the emulator runs at the correct speed. Getting them wrong means the
+CPU runs too fast (corrupting timing-sensitive ROM routines) or too slow
+(making the machine feel sluggish).
+
+### How the Code Works
+
+- **`cpuClock = 1023000`** -- the Apple II's clock speed in cycles per
+  second. This is 1.023 MHz, not a round 1 MHz. The oddball frequency comes
+  from the NTSC color burst crystal: 14.31818 MHz divided by 14 gives
+  1.02273 MHz, which rounds to 1.023 MHz. Using the actual frequency rather
+  than 1 MHz keeps timing-sensitive sound and I/O routines accurate.
+
+- **`targetFPS = 60`** -- the NTSC video refresh rate. The Apple II's video
+  hardware is designed to match 60 Hz exactly, so the emulator targets the
+  same rate.
+
+- **`cyclesPerFrame = cpuClock / targetFPS`** = 1,023,000 / 60 = 17,050 --
+  the number of CPU cycles to execute per rendered frame. The comment says
+  "~17050" but the division is exact: 1,023,000 / 60 = 17,050.0 with no
+  remainder.
+
+- **`windowScale = 3`** -- scaling factor from native Apple II pixels to
+  window pixels. A 1:1 window would be 280x192 pixels, which is tiny on a
+  modern 2K or 4K display. 3x gives 840x576, comfortably visible at normal
+  viewing distances.
+
+- **`windowW = video.ScreenW * windowScale`** -- uses the exported `ScreenW`
+  constant from the `video` package (see walkthrough_video.md Section 1).
+  `video.ScreenW` is 280; multiplied by 3 gives 840. The comment confirms
+  this: `// 840`.
+
+- **`windowH = video.ScreenH * windowScale`** -- same pattern:
+  `video.ScreenH` is 192; multiplied by 3 gives 576.
+
+### Diagram 2: Frame Budget Derivation
+
+```
+  1.023 MHz CPU clock
+  --------------------  =  17,050 cycles per frame
+    60 frames/second
+
+  Each frame has a budget of 17,050 CPU cycles.
+  At 60 fps, one frame = 16.67 ms wall-clock time.
+
+  Native resolution:  280 x 192 pixels  (video.ScreenW x video.ScreenH)
+  Window resolution:  840 x 576 pixels  (3x scale)
+
+  Pixel buffer size:  280 x 192 x 4 bytes/pixel  =  215,040 bytes
+```
+
+### Real-World Analogy
+
+A film projector runs at 24 frames per second. Each frame gets a fixed
+amount of screen time -- roughly 41 milliseconds. The Apple II's "projector"
+runs at 60 fps, so each frame gets 16.67 milliseconds. In that window, the
+CPU must execute exactly 17,050 instructions' worth of work, the screen must
+be re-rendered, and the frame must be presented. If the work finishes early,
+the projector waits; if it overruns, the next frame starts immediately.
+
+**Cross-references:**
+- walkthrough_video.md Section 1 (where `ScreenW = 280` and `ScreenH = 192`
+are defined and explained)
+- walkthrough_cpu_go.md Section 6 (Step returns cycle counts, CPU clock
+concepts)
+
+---
+
+## Section 3: `main()` -- The Entry Point (lines 31-168)
+
+The `main()` function (line 31 opens, line 168 closes) is 137 lines of
+straight-line startup code followed by an event loop. Its internal comment
+headers divide it into five phases: Load ROM, Wire the bus, Init CPU, Init
+video, Init SDL2, and the Main loop. The sub-sections below follow those
+headers.
+
+### Sub-section 3a: Flag Parsing and ROM Loading (lines 32-43)
+
+**What It Is**: Lines 32-43 parse the `--rom` command-line flag and call
+`loadROM` to read the ROM file from disk.
+
+**How the Code Works**: `flag.String("rom", "roms/Apple2_Plus.rom", ...)`
+registers a string flag with the default path `roms/Apple2_Plus.rom`. Note
+the capitalization: Phase 3 used `apple2plus.rom` (all lowercase); Phase 4
+uses `Apple2_Plus.rom` (mixed case matching the common distribution
+filename). After `flag.Parse()`, the pointer `*romPath` holds the user-
+supplied path or the default.
+
+If `loadROM` returns an error, `main` prints the error to `os.Stderr` and
+exits with code 1. The error message in Phase 4 is shorter than Phase 3's --
+it gives only the three-line directory setup hint, not the multi-line list
+of common ROM sizes. The `--trace` flag from Phase 3 is completely gone;
+Phase 4 does not expose a trace mode.
+
+**Differences from Phase 3**: The `--trace` flag and `traceCount` variable
+no longer exist. The default ROM filename changed. The error message was
+shortened (removed the "Common ROM sizes" block).
+
+**Cross-references:**
+- walkthrough_main_phase3.md Section 2a (original flag parsing explanation)
+- walkthrough_main_phase3.md Section 2b (original loadROM error message)
+
+---
+
+### Sub-section 3b: Wiring the Bus (lines 45-55)
+
+**What It Is**: Lines 45-55 construct the three core hardware devices and
+connect them to the address bus via three `Map` calls.
+
+**How the Code Works**:
 
 ```go
 ram := memory.NewRAM()
 sw := appleio.NewSoftSwitches()
-b := bus.New()
-```
+b := bus.NewBus()
 
-Three constructors, three values. The ROM was already built by `loadROM` above, so we do not need a fourth constructor here.
-
-`memory.NewRAM()` allocates 64 KB of zeroed storage. The RAM constructor is covered in the memory walkthrough (Section 2: NewRAM). `appleio.NewSoftSwitches()` creates the softswitch block with its initial state (text mode on, keyboard cleared). The softswitch constructor is covered in the I/O walkthrough (Section 2: NewSoftSwitches). `bus.New()` creates an empty router with no devices mapped. The bus constructor is covered in the bus walkthrough (Section 3: New).
-
-Declaration order here does not matter: none of the four constructors calls any of the others. The bus `b` is a blank router until we call `Map` -- and that is the next sub-section.
-
-### Sub-section 2d: Wiring the Bus -- Three `Map` Calls
-
-```go
-// Base layer: RAM across the full space (ROM overlays on top)
 b.Map(0x0000, 0xBFFF, ram)
-
-// I/O soft switches
 b.Map(0xC000, 0xC0FF, sw)
-
-// Slot ROM area -- empty for now (reads $00)
-// Later iterations will populate slots (e.g., Disk II in slot 6).
-
-// ROM overlay -- sits on top of RAM in the ROM region
 b.Map(rom.Base, rom.End(), rom)
 ```
 
-This is the most important sub-section in the entire walkthrough. Every forward pointer in every previous walkthrough lands here. These three lines are the reason the bus exists at all.
+`memory.NewRAM()` allocates 65,536 (0x10000) bytes of zero-filled RAM (see
+walkthrough_memory.md Section 2). `appleio.NewSoftSwitches()` constructs the
+I/O softswitch block that handles the `$C000`-`$C0FF` (49,152-49,407)
+address range (see walkthrough_io.md Section 2). `bus.NewBus()` creates an
+empty address bus with no mappings yet.
 
-**The three `Map` calls, one at a time**:
+The three `Map` calls register the memory map:
 
-1. `b.Map(0x0000, 0xBFFF, ram)` covers addresses `$0000` through `$BFFF` (0 through 49,151). This is the RAM layer -- zero page, the stack page, the six text and graphics screen pages, and all of upper RAM available for programs.
+1. `b.Map(0x0000, 0xBFFF, ram)` -- RAM covers `$0000`-`$BFFF` (0-49,151),
+the lower 48 KB.
+2. `b.Map(0xC000, 0xC0FF, sw)` -- I/O softswitches cover `$C000`-`$C0FF`
+(49,152-49,407), the 256-byte I/O page.
+3. `b.Map(rom.Base, rom.End(), rom)` -- the ROM is mapped at whatever base
+address `loadROM` detected (either `$D000` at 53,248 for 12 KB, or `$C000`
+at 49,152 for 16 KB).
 
-2. `b.Map(0xC000, 0xC0FF, sw)` covers addresses `$C000` through `$C0FF` (49,152 through 49,407). This is the 256-byte I/O softswitch window. Reads and writes here trigger hardware state changes rather than simply accessing bytes. (See the I/O walkthrough Section 3 for the full read-with-side-effects mechanism.)
+The bus uses last-match-wins ordering (see walkthrough_bus.md Section 4), so
+the ROM overlay on top of RAM is correct: a read at `$D000` finds the ROM
+entry registered after the RAM entry.
 
-3. `b.Map(rom.Base, rom.End(), rom)` uses dynamic bounds. For a 12 KB ROM, `rom.Base` is `$D000` (53,248) and `rom.End()` returns `$FFFF` (65,535). For a 16 KB ROM, `rom.Base` is `$C000` (49,152) and `rom.End()` is still `$FFFF`. The `memory.LoadROM` function sets these fields based on the base address passed in; see the memory walkthrough's ROM section for `Base`, `End`, and `Size`.
+**Variable naming**: `ram`, `sw`, `vid`, and `c` are brief single-word
+identifiers. The bus is simply `b`. This follows Go's convention that short
+variable names are acceptable when the type is unambiguous from context (`b
+:= bus.NewBus()` leaves no doubt). The `b.Dump()` call present in Phase 3 is
+gone -- Phase 4 is a graphical application and does not print bus maps to
+stdout.
 
-**Why RAM ends at `$BFFF` instead of `$FFFF`**: We could have written `b.Map(0x0000, 0xFFFF, ram)` and relied entirely on last-match-wins to handle the I/O and ROM regions. Ending RAM cleanly at `$BFFF` is a self-documenting choice -- the `b.Dump()` output maps cleanly to the Apple II+ memory layout at a glance. Both approaches produce the same behavior at runtime. The bus walkthrough Section 4 (Map) covers the mechanics of range registration.
+**Cross-references:**
+- walkthrough_bus.md Section 4 (Map, last-match-wins ordering)
+- walkthrough_memory.md Section 2 (NewRAM, the RAM.Data field)
+- walkthrough_io.md Section 2 (NewSoftSwitches)
 
-**Overlay order and last-match-wins -- the payoff for every forward reference**: The bus `Read` method scans its mapping list from the tail backward, and the last matching mapping wins. This is the mechanism described in bus walkthrough Section 5 (Read) and Section 8 (Putting It Together). Here is how the three calls play out:
+---
 
-- RAM was registered first. It is the base layer for everything in `$0000`-`$BFFF`.
-- The softswitch block was registered second. For any address in `$C000`-`$C0FF`, the bus scan reaches the softswitch entry before the RAM entry. Softswitches win over RAM in that window.
-- ROM was registered third. For any address in `$D000`-`$FFFF`, the bus scan reaches the ROM entry before the RAM entry. ROM wins over RAM in that region.
+### Sub-section 3c: CPU Init (lines 57-60)
 
-Map registration order IS execution order for overlays, and we build them up from base layer to final overlay, last call wins.
+**What It Is**: Lines 57-60 create the CPU and perform a hardware reset.
 
-One edge case worth stating honestly: for the 16 KB ROM path, `rom.Base` is `$C000`, meaning ROM overlaps the I/O window. In the current code, ROM is registered AFTER the softswitch block, so ROM wins over the softswitches from `$C000` to `$C0FF` -- the softswitches are invisible when a 16 KB ROM is loaded. The 12 KB case is the tested path; the 16 KB overlap is a phase-3 limitation that a phase-4 bus rework will address.
-
-**The slot ROM comment**: The commented-out note about slot ROM at `$C100`-`$CFFF` is a forward pointer. In a fully equipped Apple II+, slots 1 through 7 each get a 256-byte window at `$Cn00` (so slot 1 at `$C100`, slot 2 at `$C200`, and so on through slot 7 at `$C700`), plus a shared 2 KB expansion-ROM area at `$C800`-`$CFFF` that cards can page in on demand. At phase 3, no slot cards are installed and no ROM is mapped there. Reads in that range fall off the end of the bus scan and return `$FF` via open-bus fallback (described in bus walkthrough Section 5). The full memory map context is in memory walkthrough Section 4 (Putting It Together).
-
-**Effective memory map after the three `Map` calls (Diagram 2)**:
-
-```
-  Address range       Device           Won by              Decimal range
-  ------------------  ---------------  ------------------  ---------------
-  $0000 - $BFFF       RAM              1st Map call        0     - 49151
-  $C000 - $C0FF       SoftSwitches     2nd Map call        49152 - 49407
-  $C100 - $CFFF       (unmapped)       none -- open bus    49408 - 53247
-  $D000 - $FFFF       ROM              3rd Map call        53248 - 65535
-```
-
-The gap from `$C100` to `$CFFF` (49,408 through 53,247) is intentional. RAM ends at `$BFFF`, the softswitch window covers only `$C000`-`$C0FF`, and ROM starts at `$D000`. There is no device mapped in between. Any read in that gap falls through the bus scan without a match and returns `$FF` -- the open-bus value. On a real Apple II+, this region is the slot ROM space for expansion cards in slots 1-7. The emulator leaves it empty until slot cards are added in a later phase. This behavior is correct for a stock Apple II+ with no cards installed.
-
-### Sub-section 2e: Printing the Bus Map
-
-```go
-fmt.Printf("Apple II Emulator -- Iteration 2\n")
-fmt.Printf("ROM: %s (%d bytes at $%04X--$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
-fmt.Println("Bus map:")
-b.Dump()
-fmt.Println()
-```
-
-`b.Dump()` iterates through every registered mapping and prints one line per device. The bus walkthrough Section 7 (Dump) covers exactly what this produces and how it formats the output. A typical run looks like:
-
-```
-Apple II Emulator -- Iteration 2
-ROM: roms/apple2plus.rom (12288 bytes at $D000--$FFFF)
-Bus map:
-  $0000-$BFFF *memory.RAM
-  $C000-$C0FF *io.SoftSwitches
-  $D000-$FFFF *memory.ROM
-```
-
-Why print this before executing a single instruction? A wrong memory map is one of the most common emulator bugs. If `$D000` shows up backed by RAM, the boot will fail silently: the CPU reads two zero bytes at `$FFFC`/`$FFFD`, sets PC to `$0000`, and starts executing whatever garbage is in zero page. Printing the map at startup lets you eyeball it against the known-good Apple II+ layout before the trace begins. If anything is wrong, you see it on the first line of output -- before spending five minutes wondering why the trace looks strange.
-
-### Sub-section 2f: Boot the CPU
+**How the Code Works**:
 
 ```go
 c := cpu.NewCPU(b)
 c.Reset()
-
-resetVec := uint16(b.Read(0xFFFC)) | uint16(b.Read(0xFFFD))<<8
-fmt.Printf("Reset vector: $%04X\n", resetVec)
-fmt.Printf("Starting CPU trace (%d instructions)...\n\n", *traceCount)
+fmt.Printf("Reset vector: $%04X\n", c.PC)
 ```
 
-`cpu.NewCPU(b)` creates a CPU and wires it to the bus. The CPU's constructor accepts anything satisfying the `cpu.Memory` interface, which requires `Read(addr uint16) byte` and `Write(addr uint16, val byte)`. Our bus has exactly those methods with exactly those signatures, so it satisfies the interface through Go's structural typing -- no explicit declaration required. This is covered in the CPU walkthrough Section 3 (Memory Interface) and in the bus walkthrough Section 1 (Device Interface).
+`cpu.NewCPU(b)` takes the bus as its only argument. The CPU does not know
+about RAM, ROM, or I/O directly -- the bus is the CPU's entire view of the
+world. Every fetch, read, and write goes through `b.Read()` and `b.Write()`
+(see walkthrough_bus.md Section 5).
 
-`c.Reset()` simulates pressing the RESET button on a real Apple II. It reads the two bytes at `$FFFC` (65,532) and `$FFFD` (65,533), assembles them into a 16-bit little-endian address, and loads that address into PC. After this call, the CPU is ready to execute from the monitor ROM's entry point. The full reset mechanics are covered in the CPU walkthrough Section 5 (New and Reset).
+`c.Reset()` performs the 6502 reset sequence: it reads two bytes from
+`$FFFC`-`$FFFD` (65,532-65,533) through the bus, forming the 16-bit reset
+vector, and loads it into `PC`. Because the bus routes `$FFFC`-`$FFFD` to
+the ROM, this reads the ROM's first-boot entry point. For a standard Apple
+II+ 12 KB ROM, this is `$E000` (57,344) -- the beginning of the Autostart
+firmware (see walkthrough_cpu_go.md Section 5).
 
-The next two lines manually read the reset vector from the bus and print it:
+The `fmt.Printf` line prints the reset vector to stdout as a startup
+diagnostic. This is the only CPU-state output that Phase 4 preserves from
+Phase 3; the full per-instruction trace is gone.
+
+**Cross-references:**
+- walkthrough_cpu_go.md Section 5 (reset sequence, how PC is set from
+$FFFC/$FFFD)
+- walkthrough_bus.md Section 5 (Read routing, how $FFFC gets routed to ROM)
+
+---
+
+### Sub-section 3d: Video Init (lines 62-63)
+
+**What It Is**: A single line that creates the video renderer.
+
+**How the Code Works**:
 
 ```go
-resetVec := uint16(b.Read(0xFFFC)) | uint16(b.Read(0xFFFD))<<8
+vid := video.NewVideo(ram.Data[:])
 ```
 
-Let's walk through this carefully. `b.Read(0xFFFC)` returns a `byte` (alias `uint8`), which is an 8-bit unsigned integer. To OR a second byte into the high position we need 16 bits of space, so `uint16(b.Read(0xFFFC))` widens the low byte to 16 bits without changing its value. `uint16(b.Read(0xFFFD)) << 8` widens the high byte and shifts it left 8 positions so it occupies bits 8-15. The bitwise OR combines both halves into one 16-bit address. This is the same little-endian assembly pattern covered in the memory walkthrough and the CPU walkthrough -- two bytes in memory, low byte first, high byte second.
+`ram.Data[:]` creates a Go slice from the RAM struct's internal
+`[65536]byte` array. The slice covers all 65,536 bytes of RAM.
+`video.NewVideo` stores this slice and later reads bytes from it during
+`RenderText()` (see walkthrough_video.md Section 3).
 
-`c.PC` already holds this value after `c.Reset()`. Reading the bus manually here is purely diagnostic: the print in the trace output reminds anyone reading a log exactly where the ROM starts. For the standard Apple II+ 12 KB ROM, the reset vector typically points to an address in the `$FF00`-`$FFFF` (65,280-65,535) range, for example `$FF59` (65,369).
+The important design point here is that the video renderer **bypasses the
+bus entirely**. It reads RAM directly rather than calling `b.Read()`. This
+is a deliberate coupling trade-off: at 40 characters per row, 24 rows, 60
+fps, reading the text page via the bus would require 40 x 24 x 60 = 57,600
+bus dispatches per second, each scanning a mapping slice. Direct RAM access
+avoids this overhead.
 
-### Sub-section 2g: The Trace Loop
+The trade-off is that the video renderer is tightly coupled to the RAM
+struct. This will need reworking if the emulator later implements bank
+switching (the language card), where the ROM region `$D000`-`$FFFF` can be
+remapped to RAM. See walkthrough_video.md Section 8 Q1 for a full discussion
+of this design decision.
+
+The `video` package was not present in Phase 3 at all.
+
+**Cross-references:**
+- walkthrough_video.md Section 3 (NewVideo constructor, the RAM slice
+argument)
+- walkthrough_video.md Section 8 Q1 (why the video renderer bypasses the bus)
+- walkthrough_memory.md Section 2 (RAM.Data field, the underlying array)
+
+---
+
+### Sub-section 3e: SDL2 Initialization (lines 65-104)
+
+**What It Is**: Lines 65-104 initialize the SDL2 library and create the
+window, renderer, and texture that will display the emulated screen.
+
+**How the Code Works**: SDL2 has a strict resource hierarchy: you must
+initialize the library before creating a window, create a window before
+creating a renderer, and create a renderer before creating a texture. The
+code follows this order, and Go's `defer` mechanism handles teardown in
+reverse order.
+
+**Step 1 -- Library init (line 66)**:
 
 ```go
-prevPC := c.PC
-stuckCount := 0
+if err := sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS)); err != nil {
+```
 
-for i := 0; i < *traceCount || *traceCount == 0; i++ {
-    pc := c.PC
-    op := b.Read(pc)
-    b1 := b.Read(pc + 1)
-    b2 := b.Read(pc + 2)
+`sdl.Init` initializes SDL subsystems. `sdl.INIT_VIDEO` activates the
+display subsystem; `sdl.INIT_EVENTS` activates the event queue (keyboard,
+mouse, quit). The bitwise OR combines them into a single flags word. The
+explicit `uint32(...)` casts on `INIT_VIDEO` and `INIT_EVENTS` are explained
+below.
 
-    name := opNames[op]
-    size := opSizes[op]
+**Step 2 -- Window (lines 72-81)**:
 
-    var bytesStr string
-    switch size {
-    case 1:
-        bytesStr = fmt.Sprintf("%02X      ", op)
-    case 2:
-        bytesStr = fmt.Sprintf("%02X %02X   ", op, b1)
-    case 3:
-        bytesStr = fmt.Sprintf("%02X %02X %02X", op, b1, b2)
-    default:
-        bytesStr = fmt.Sprintf("%02X      ", op)
-    }
+```go
+window, err := sdl.CreateWindow(
+    "Apple II Emulator",
+    sdl.WINDOWPOS_CENTERED, sdl.WINDOWPOS_CENTERED,
+    int32(windowW), int32(windowH),
+    sdl.WINDOW_SHOWN,
+)
+```
 
-    fmt.Printf("%04X  %s  %-4s  A:%02X X:%02X Y:%02X SP:%02X P:%02X\n",
-        pc, bytesStr, name, c.A, c.X, c.Y, c.SP, c.P)
+`sdl.WINDOWPOS_CENTERED` tells SDL to center the window on screen. `windowW`
+and `windowH` are 840 and 576 (declared in the `const` block).
+`sdl.WINDOW_SHOWN` makes the window visible immediately. `defer
+window.Destroy()` registers cleanup.
 
-    c.Step()
+**Step 3 -- Renderer (lines 84-90)**:
 
-    if c.PC == prevPC {
-        stuckCount++
-        if stuckCount > 2 {
-            fmt.Printf("\n--- CPU stuck at $%04X (JMP to self) ---\n", c.PC)
-            break
+```go
+renderer, err := sdl.CreateRenderer(window, -1,
+    sdl.RENDERER_ACCELERATED|sdl.RENDERER_PRESENTVSYNC)
+```
+
+The `-1` means "pick the best available rendering driver."
+`sdl.RENDERER_ACCELERATED` requests GPU-accelerated rendering.
+`sdl.RENDERER_PRESENTVSYNC` asks SDL to synchronize `renderer.Present()`
+with the display's vertical refresh signal -- this is the primary frame-rate
+limiter. These two constants appear bare (no explicit cast) and compile
+correctly on the current platform.
+
+**Step 4 -- Scaling hint (line 93)**:
+
+```go
+sdl.SetHint(sdl.HINT_RENDER_SCALE_QUALITY, "0")
+```
+
+The string `"0"` selects nearest-neighbor (point) scaling. Without this
+hint, SDL defaults to bilinear interpolation, which blurs the 280x192 pixels
+when scaling up to 840x576. For pixel-art emulation, nearest-neighbor is
+always the right choice.
+
+**Step 5 -- Texture (lines 95-103)**:
+
+```go
+texture, err := renderer.CreateTexture(
+    uint32(sdl.PIXELFORMAT_RGBA32),
+    sdl.TEXTUREACCESS_STREAMING,
+    int32(video.ScreenW), int32(video.ScreenH),
+)
+```
+
+The texture is `video.ScreenW` x `video.ScreenH` (280x192) pixels.
+`sdl.PIXELFORMAT_RGBA32` means each pixel is four bytes: red, green, blue,
+alpha. This matches the format that `video.RenderText()` writes into
+`vid.Pixels` (see walkthrough_video.md Section 2).
+`sdl.TEXTUREACCESS_STREAMING` tells SDL the texture will be updated every
+frame via `texture.Update()`, as opposed to a static texture or a render
+target.
+
+#### CGo Constant Casting
+
+The explicit `uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66),
+and `PIXELFORMAT_RGBA32` (line 96) deserve explanation. The `go-sdl2`
+library wraps SDL's C header `#define` macros via CGo. In C, these macros
+are simply integer literals. When CGo imports them into Go, they appear as
+untyped constants with an internal CGo representation. When such a constant
+is passed to a Go function that expects a specific type (`uint32`, `int32`,
+etc.), Go's type system may refuse the implicit conversion.
+
+The safe pattern is: **when in doubt, cast**. The current code has explicit
+casts on `INIT_VIDEO`, `INIT_EVENTS`, and `PIXELFORMAT_RGBA32` because the
+function signatures for `sdl.Init` and `renderer.CreateTexture` require
+`uint32`. Other constants (`WINDOWPOS_CENTERED`, `WINDOW_SHOWN`,
+`RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`,
+`HINT_RENDER_SCALE_QUALITY`, `TEXTUREACCESS_STREAMING`) appear bare and
+compile correctly on the current platform (Go 1.21, darwin/arm64). Whether a
+bare CGo constant compiles depends on how Go's type checker resolves the
+expression and can vary across Go versions and platforms. If you encounter
+CGo compile errors with SDL constants on a different platform, adding an
+explicit cast is always the correct fix.
+
+### Diagram 3: SDL Resource Hierarchy and Defer Order
+
+```
+  Creation order:            Destruction order (defer LIFO):
+  -----------------          ---------------------------------
+  1. sdl.Init()              4. sdl.Quit()          (first defer)
+  2. CreateWindow()          3. window.Destroy()     (second defer)
+  3. CreateRenderer()        2. renderer.Destroy()   (third defer)
+  4. CreateTexture()         1. texture.Destroy()    (fourth defer)
+
+  Child resources MUST be destroyed before parents.
+  Go's defer LIFO order guarantees this automatically.
+```
+
+### Diagram 4: CGo Constant Type Casting Pattern
+
+```
+  C header (#define):          Go sees:                  Code uses:
+  ----------------------       ----------------------    ----------------------
+  #define SDL_INIT_VIDEO 0x20  sdl.INIT_VIDEO            uint32(sdl.INIT_VIDEO)
+                               (untyped CGo constant)    (explicit cast added)
+
+  Without the cast (hypothetical):
+    sdl.Init(sdl.INIT_VIDEO | sdl.INIT_EVENTS)
+    --> may fail: untyped constant used where uint32 expected
+
+  With the cast (current code, line 66):
+    sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS))
+    --> compiles and works correctly on all platforms
+
+  Rule: when in doubt, cast SDL constants explicitly.
+```
+
+### Real-World Analogy
+
+Setting up a workshop. First you plug in the power strip (`sdl.Init`), then
+bolt the workbench to the floor (`CreateWindow`), then mount the lamp on the
+workbench (`CreateRenderer`), then place a canvas on the easel under the
+lamp (`CreateTexture`). When closing the shop, you take down the canvas
+first, then the lamp, then the bench, then unplug the power strip. Go's
+`defer` enforces this order automatically -- you declare the cleanup steps
+in the order you create resources, and Go reverses them at exit.
+
+**Cross-references:**
+- walkthrough_video.md Section 1 (`ScreenW`, `ScreenH` constants, used in
+texture creation)
+- walkthrough_video.md Section 2 (RGBA32 pixel format, what the video
+renderer writes)
+- walkthrough_video.md Section 7 "The SDL Upload Step" (forward pointer that
+lands in sub-section 3f below)
+
+---
+
+### Sub-section 3f: The Main Loop (lines 108-168)
+
+**What It Is**: The 60fps game loop that runs from program start until the
+user quits.
+
+**How the Code Works**: The loop variable `running` is initialized to `true`
+before the loop and set to `false` by quit events and the Escape key. The
+loop body has five numbered phases, each corresponding to one of the loop's
+comment headers.
+
+**Phase 1 -- Event Polling (lines 117-137)**:
+
+```go
+for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+    switch e := event.(type) {
+    case *sdl.QuitEvent:
+        running = false
+    case *sdl.KeyboardEvent:
+        if e.Type == sdl.KEYDOWN {
+            ...
         }
-    } else {
-        stuckCount = 0
     }
-    prevPC = c.PC
 }
 ```
 
-This loop is the heart of the harness. Everything built so far -- the bus, the RAM, the ROM, the CPU -- exists to make this loop possible.
+`sdl.PollEvent()` returns one event at a time and returns `nil` when the
+queue is empty. The `for` loop drains the entire event queue before
+advancing to the CPU step. This is important: if the queue were drained only
+one event at a time, rapid keystrokes could accumulate lag.
 
-**The setup before the loop**: `prevPC` remembers the last PC value. `stuckCount` counts consecutive iterations where PC did not move. Both exist for the stuck-loop detector described below.
+The type switch distinguishes `*sdl.QuitEvent` (window close button) from
+`*sdl.KeyboardEvent` (keyboard). Only `sdl.KEYDOWN` events are processed --
+the Apple II keyboard has no key-release concept, so `KEYUP` events are
+ignored.
 
-**The `for` condition**: `for i := 0; i < *traceCount || *traceCount == 0; i++`. This is a Go idiom for "run N times OR run forever." When `*traceCount` is a positive number, `i < *traceCount` eventually becomes false and the loop exits normally. When `*traceCount` is 0, the second operand `*traceCount == 0` is always true, so the entire OR is always true. Concrete example: running `./apple2emu -trace 0` means the counter never exits the loop, and only the stuck-loop detector can break out. Running `-trace 200` (the default) exits after 200 iterations regardless of what the CPU is doing.
+For keyboard events: `sdlKeyToApple(e)` (detailed in Section 4) translates
+the SDL keycode to an Apple II key code. A return value of 0 means "no Apple
+II equivalent, discard." If the key maps to a valid code, `sw.PressKey(key)`
+delivers it to the softswitch layer, which stores it in the keyboard latch
+register at `$C000` (49,152) and sets the strobe bit at `$C010` (49,168)
+(see walkthrough_io.md Section 5). The running Apple II firmware polls
+`$C000` in its keyboard-input loop and consumes the keypress.
 
-**Peek and disassemble**: Before calling `c.Step()`, we peek at three bytes starting at the current PC: `op`, `b1`, and `b2`. `op` is the opcode. `b1` and `b2` are the potential first and second operand bytes. We look up `opNames[op]` and `opSizes[op]` from the tables filled by `init()` (covered in Section 5 of this walkthrough). The size tells us how many of the peeked bytes actually belong to this instruction.
+Escape and Ctrl+R are handled after `sdlKeyToApple` for two reasons: Escape
+has an SDL keycode (`sdl.K_ESCAPE`) but is handled as a quit rather than
+being sent to the Apple II; Ctrl+R calls `c.Reset()` directly rather than
+sending a control character to the Apple II keyboard.
 
-**The bytes column formatter**: the `switch size` block builds a fixed-width string of hex bytes for the trace line. A 1-byte instruction uses only `op`; a 2-byte instruction uses `op` and `b1`; a 3-byte instruction uses all three. Padding spaces are included in each case string so every trace line has the same column width. Peeked bytes `b1` and `b2` are harmless when `size < 3` -- they are read from memory but never included in the formatted output.
-
-**The print line**: each trace line looks like:
-
-```
-%04X  %s  %-4s  A:%02X X:%02X Y:%02X SP:%02X P:%02X
-```
-
-- `%04X` for PC: exactly 4 uppercase hex digits with leading zeros.
-- `%s` for the bytes column: the fixed-width hex string built above.
-- `%-4s` for the mnemonic: left-justified in a 4-character field so the register columns align.
-- `%02X` for each register: exactly 2 hex digits with leading zeros.
-
-**`c.Step()`**: one complete fetch-decode-execute cycle. The CPU reads the opcode at PC, decodes its addressing mode, fetches any operand bytes, executes the operation, updates registers and flags, advances PC, and increments the cycle counter. The full Step mechanics are covered in the CPU walkthrough Section 6 (Step).
-
-**Stuck-loop detection**: after `Step()` returns, we compare the new `c.PC` to `prevPC`. If they are equal, the CPU just executed an instruction that left PC unchanged -- almost certainly a `JMP` to the current address, the 6502's equivalent of an idle spin (`JMP *` in assembly notation). We increment `stuckCount`. When `stuckCount` exceeds 2 (three consecutive same-PC observations), we print a stuck message and `break` out of the loop.
-
-The threshold of 3 avoids false positives. A single same-PC observation could theoretically occur in tight branch loops on some corner-case instruction sequences. Requiring three in a row is a low-cost safety margin. The cpu_test walkthrough's Section on the Klaus Dormann Test describes the same idea in the context of the Dormann test harness -- the test loop detects that the test ROM has reached its final idle loop by checking whether PC stopped advancing. This is the "real emulator uses the same trap-detection trick" forward pointer from that walkthrough, closed here.
-
-**Sample trace output (Diagram 3)**:
-
-```
-FF59  D8         CLD   A:00 X:00 Y:00 SP:FD P:24
-FF5A  58         CLI   A:00 X:00 Y:00 SP:FD P:24
-FF5B  A0 7F      LDY   A:00 X:00 Y:00 SP:FD P:20
-FF5D  8C F8 07   STY   A:00 X:00 Y:7F SP:FD P:20
-FF60  A9 00      LDA   A:00 X:00 Y:7F SP:FD P:20
-```
-
-Reading the first line: at PC `$FF59` (65,369), the next instruction is the 1-byte opcode `$D8`, which is `CLD` -- clear the decimal flag. The accumulator is zero, X is zero, Y is zero, the stack pointer is `$FD` (253), and the processor status register is `$24`. The trace prints registers **before** each instruction executes, so line 1 shows the state going INTO `CLD`. `CLD` clears bit 3 (the D flag), which was already 0 in `$24` = `0010 0100`, so the P register stays `$24` going into `CLI` on line 2. `CLI` then clears bit 2 (the I flag), which is why line 3 shows `$20` = `0010 0000` -- only bit 5 (the "unused" bit, always 1 on a real 6502) remains set. Refer to the CPU walkthrough's Status Flags section for the exact bit layout. The specific bytes above come from a standard Apple II+ Autostart ROM; the format will match for any loaded ROM image.
-
-### Sub-section 2h: Post-mortem
+**Phase 2 -- CPU Execution (lines 139-142)**:
 
 ```go
-fmt.Printf("\nFinal state: PC:%04X A:%02X X:%02X Y:%02X SP:%02X P:%02X  Cycles:%d\n",
-    c.PC, c.A, c.X, c.Y, c.SP, c.P, c.Cycles)
-
-fmt.Println("\nText page 1 preview (first 3 rows, raw bytes):")
-for row := 0; row < 3; row++ {
-    base := textRowAddr(row)
-    fmt.Printf("  $%04X: ", base)
-    for col := 0; col < 40; col++ {
-        ch := ram.Data[base+uint16(col)]
-        fmt.Printf("%02X ", ch)
-    }
-    fmt.Println()
+for cycles := 0; cycles < cyclesPerFrame; {
+    cycles += c.Step()
 }
 ```
 
-**Final register dump**: after the trace loop exits (by count or by stuck detection), we print the full CPU state one last time, including the cycle count `c.Cycles`. This is the post-mortem: a snapshot of where the ROM left the CPU at the end of the trace. Cross-reference the CPU walkthrough for the meaning of each register field.
+This loop executes CPU instructions until the frame's cycle budget
+(`cyclesPerFrame = 17,050`) is consumed. `c.Step()` fetches, decodes, and
+executes one instruction and returns the number of cycles it took (see
+walkthrough_cpu_go.md Section 6). The loop may overshoot the budget
+slightly: if 17,047 cycles have been consumed and the next instruction takes
+6 cycles, the total becomes 17,053. This two-to-six cycle overshoot per
+frame is standard for emulators -- it is far smaller than the measurement
+noise in SDL's vsync timing.
 
-**Text screen preview**: the loop reads the first three rows of text page 1 and prints 40 hex bytes per row. A few things to note:
+Phase 4 does not include stuck-loop detection or trace output. It trusts the
+CPU. An unimplemented opcode will still cause a Go panic (see Section 7 Q6).
 
-- `textRowAddr(row)` computes the non-linear base address for each row. The formula is explained fully in Section 4 of this walkthrough.
-- `ram.Data[base+uint16(col)]` reads directly from the RAM backing array, bypassing the bus entirely. This is a style choice: after the CPU has stopped executing, nothing can change the RAM contents, so going directly to the backing store is both faster and slightly more explicit ("we know text page 1 is in RAM"). Using `b.Read(base + uint16(col))` would produce identical results -- it would route through the bus and return the same bytes from the same RAM cells. The choice is not a correctness requirement.
-- Text page 1 lives at `$0400` through `$07FF` (1,024 through 2,047), a 1 KB window that holds 24 rows of 40 characters. The Apple II monitor ROM typically writes specific character values into this region during its initialization sequence. If you see `$A0` repeated (160 decimal, the Apple II's screen-fill character with high bit set), the monitor cleared the screen successfully. If you see all zeroes, initialization may not have run yet.
-- This preview is a smoke test: it shows you whether the ROM touched the text screen during the traced instructions. Phase 4 will replace it with a real renderer that translates these byte values through the Apple II character ROM into visible glyphs.
-
----
-
-## Section 3: `loadROM` -- Size Detection (lines 127-146)
-
-### What It Is
+**Phase 3 -- Render (line 145)**:
 
 ```go
-func loadROM(path string) (*memory.ROM, error) {
-    info, err := os.Stat(path)
-    if err != nil {
-        return nil, err
-    }
+vid.RenderText()
+```
 
-    size := info.Size()
-    switch size {
-    case 12288: // 12 KB -- standard Apple II+ ROM
-        return memory.LoadROM(path, 0xD000)
-    case 16384: // 16 KB -- includes $C000 area
-        return memory.LoadROM(path, 0xC000)
-    default:
-        if size > 0 && size <= 12288 {
-            return memory.LoadROM(path, uint16(0x10000-size))
-        }
-        return nil, fmt.Errorf("unexpected ROM size %d bytes (expected 12288 or 16384)", size)
-    }
+One function call fills the entire 215,040-byte pixel buffer (`vid.Pixels`)
+by reading the 960 text-page bytes from RAM, looking up each character in
+the character generator, and writing RGBA32 pixels. For the internals of
+this call -- the triple-nested loop, `textLineAddr`, flash timer, and
+character encoding -- see walkthrough_video.md Section 6. This walkthrough
+does not repeat that explanation.
+
+Note on Phase 4's open forward pointer: the io walkthrough
+(walkthrough_io.md Section 6, Step 7) says "the video renderer will consult
+`TextMode` and `HiRes` on every frame to decide how to draw the screen."
+That is still unresolved: Phase 4 calls `vid.RenderText()` unconditionally
+on every frame, regardless of the softswitch state. The `TextMode` and
+`HiRes` softswitches exist and are tracked by the `SoftSwitches` struct, but
+the video renderer does not read them yet. A future phase will add a
+`vid.Render(sw)` call that checks these switches and dispatches to the
+appropriate renderer.
+
+**Phase 4 -- SDL Present (lines 147-151)**:
+
+```go
+texture.Update(nil, unsafe.Pointer(&vid.Pixels[0]), int(video.ScreenW)*4)
+renderer.Clear()
+renderer.Copy(texture, nil, nil)
+renderer.Present()
+```
+
+`texture.Update` copies the pixel buffer from Go memory to GPU memory. The
+three arguments are:
+- `nil` -- update the entire texture (no sub-rectangle)
+- `unsafe.Pointer(&vid.Pixels[0])` -- a raw pointer to the first byte of the
+Go slice; this is how Go data crosses the CGo boundary into SDL's C layer
+- `int(video.ScreenW)*4` = 280 x 4 = 1,120 -- the "pitch" (bytes per row);
+SDL uses this to advance from one row to the next within the pixel buffer
+
+`renderer.Clear()` fills the renderer's back buffer with the current draw
+color (default black). `renderer.Copy(texture, nil, nil)` copies the 280x192
+texture onto the back buffer; the first `nil` means "copy the entire
+texture," and the second `nil` means "stretch to fill the entire renderer"
+-- this is where the 280x192 source becomes the 840x576 display.
+`renderer.Present()` swaps the back buffer to the screen.
+
+For a detailed explanation of `texture.Update` and the pitch calculation,
+see walkthrough_video.md Section 7 "The SDL Upload Step."
+
+**Phase 5 -- Frame Timing (lines 153-167)**:
+
+```go
+frameCount++
+if time.Since(fpsTimer) >= time.Second {
+    window.SetTitle(fmt.Sprintf("Apple II Emulator -- %d fps", frameCount))
+    frameCount = 0
+    fpsTimer = time.Now()
+}
+
+elapsed := time.Since(frameStart)
+target := time.Second / targetFPS
+if elapsed < target {
+    sdl.Delay(uint32((target - elapsed).Milliseconds()))
 }
 ```
 
-### Why It Matters
+The FPS counter increments `frameCount` each frame and writes the count to
+the window title bar once per second, then resets the counter. This gives a
+live "N fps" display in the title bar.
 
-Apple II+ ROM dumps exist in multiple sizes. A 12,288-byte (12 KB) dump contains exactly the `$D000` (53,248) through `$FFFF` (65,535) region -- 12,288 bytes of monitor firmware, Integer BASIC, and the Autostart ROM. A 16,384-byte (16 KB) dump extends down to `$C000` (49,152) and includes the slot ROM area as well.
+The vsync fallback uses `time.Since(frameStart)` to measure how long the
+frame took. If it finished in less than `target` (16.67ms), `sdl.Delay()`
+sleeps for the remaining time. This is a safety net: if
+`RENDERER_PRESENTVSYNC` is working correctly, `renderer.Present()` already
+blocked for the remaining time. If vsync is broken (headless environment,
+certain virtual machines), the manual delay prevents the loop from spinning
+at thousands of frames per second. `sdl.Delay` takes `uint32` milliseconds
+-- another CGo-style cast from `time.Duration` via `.Milliseconds()`.
 
-Loading a ROM at the wrong base address is a silent killer. If a 12 KB ROM is loaded at `$C000` instead of `$D000`, the reset vector at `$FFFC`/`$FFFD` would point to bytes inside the ROM that are not the intended entry point. The CPU would jump somewhere wrong and execute garbage. There is no runtime error; the boot simply fails in confusing ways. `loadROM` prevents this class of error by inspecting the file size before reading a single byte and choosing the base address automatically.
-
-### How the Code Works
-
-**`os.Stat(path)`**: returns a `FileInfo` value containing filesystem metadata -- size, permissions, modification time -- without reading the file contents. This is the key insight: we only need the file size to decide which base address to use. Calling `os.ReadFile(path)` would open the file, read all 12 KB or 16 KB into memory, and close it -- three system calls. `os.Stat` is a single metadata call. When you only need a field from the filesystem record, use `Stat`.
-
-**`size := info.Size()`**: `FileInfo.Size()` returns an `int64`. We stash it and switch on it.
-
-**The switch**:
-- `case 12288`: the standard 12 KB Apple II+ ROM. Base address `$D000` (53,248). This is the canonical layout and the tested path.
-- `case 16384`: the 16 KB extended dump including the slot ROM area. Base address `$C000` (49,152). As noted in sub-section 2d, loading this ROM creates an overlap with the softswitch window.
-- `default`: a fallback for unusual ROM sizes. If `size` is positive and at most 12,288, the formula `uint16(0x10000 - size)` computes the correct base address.
-
-**The `uint16(0x10000 - size)` trick**: every Apple II+ ROM image, regardless of size, must end at `$FFFF` (65,535) -- because the reset vector at `$FFFC`/`$FFFD` is the very last thing in the ROM before the final two bytes. A ROM of N bytes ending at `$FFFF` must start at address `65536 - N` (because `$10000` is 65,536, one past the 16-bit address space). Examples:
+### Diagram 5: Main Loop Anatomy
 
 ```
-  ROM size    Decimal    Base address    Hex base
-  --------    -------    ------------    --------
-   2,048 B     2048      65536 - 2048    $F800
-   4,096 B     4096      65536 - 4096    $F000
-   8,192 B     8192      65536 - 8192    $E000
-  12,288 B    12288      65536 - 12288   $D000
+  for running {
+      frameStart = time.Now()
+      |
+      |  1. POLL EVENTS         SDL keyboard/quit -> sw.PressKey()
+      |     |
+      |  2. RUN CPU             for cycles < 17050 { cycles += c.Step() }
+      |     |
+      |  3. RENDER VIDEO        vid.RenderText()  [960 bytes -> 215,040 bytes]
+      |     |
+      |  4. SDL PRESENT         texture.Update -> Clear -> Copy -> Present
+      |     |
+      |  5. FRAME TIMING        vsync or manual sdl.Delay()
+      |                         FPS counter in title bar
+      |
+      +---- next frame (target: 16.67 ms / 60 fps) ----+
+  }
 ```
 
-The `uint16(...)` cast is safe because `size <= 12288` has already been verified, guaranteeing the result is at least `$D000` -- well within the 16-bit address space.
+### Diagram 6: SDL Texture Upload Pipeline
 
-**The error case**: if the file is larger than 12 KB and not exactly 16 KB, `loadROM` returns an error with a clear message. A 24 KB file might be a concatenated dump in a non-standard format; silently guessing a base address would mask the problem. The caller gets a clear error, fixes the file, and tries again. Cross-reference the memory walkthrough's ROM section for how `memory.LoadROM` reads the file and constructs the `*memory.ROM` struct with its `Base`, `End`, and `Size` fields.
+```
+  Go memory                        C/GPU memory
+  -----------                      ---------------
+  vid.Pixels[]uint8                SDL_Texture
+  [215,040 bytes]                  [280 x 192 RGBA32]
+       |                                |
+       | unsafe.Pointer(&vid.Pixels[0]) |
+       +-----> texture.Update() ------->+
+                pitch = 1120               |
+                                    renderer.Copy()
+                                           |
+                                    renderer.Present()
+                                           |
+                                    Screen (840 x 576)
+```
 
 ### Real-World Analogy
 
-> Think of `loadROM` as a receiving dock. A package arrives; you weigh it before opening it. If it weighs 12 pounds, it is the standard monitor ROM and you know which shelf it goes on. If it weighs 16 pounds, it is the extended dump and it goes on a lower shelf. Any other weight and you either fit it in a fallback slot by reading the label, or you refuse the delivery and ask the shipper to clarify. The receiving clerk never opens the box to check the contents -- the weight alone tells them where it belongs.
+A movie theater projection loop. (1) Check if any audience member pressed
+the exit button. (2) Film 17,050 micro-actions for the next frame. (3)
+Develop the film frame in the darkroom. (4) Project it onto the screen. (5)
+Wait until 1/60th of a second has passed before starting the next frame. If
+the projector has built-in sync (vsync), it handles the wait automatically;
+otherwise the projectionist manually counts down. Either way, the screen
+updates exactly 60 times per second.
+
+**Cross-references:**
+- walkthrough_io.md Section 5 (PressKey -- how key codes reach the Apple II)
+- walkthrough_cpu_go.md Section 6 (Step / fetch-decode-execute, cycle return
+value)
+- walkthrough_video.md Section 6 (RenderText internals)
+- walkthrough_video.md Section 7 "The SDL Upload Step" (texture.Update pitch
+explanation)
 
 ---
 
-## Section 4: `textRowAddr` -- The Apple II's Interleaved Text Screen (lines 149-153)
+## Section 4: `sdlKeyToApple` -- Keyboard Translation (lines 170-266)
 
 ### What It Is
 
-```go
-func textRowAddr(row int) uint16 {
-    return 0x0400 + uint16(row/8)*0x28 + uint16(row%8)*0x80
-}
-```
-
-Five lines of source. Hidden behind them: a 1977 hardware trick that saved Woz a handful of TTL chips at the cost of permanently confusing programmers for the next fifty years.
+`sdlKeyToApple` (function signature at line 172, closing brace at line 266)
+converts an SDL `KeyboardEvent` into an Apple II key code byte. It returns 0
+for keys that have no Apple II equivalent.
 
 ### Why It Matters
 
-The Apple II text screen is 40 columns wide by 24 rows tall, living in a 1,024-byte region from `$0400` (1,024) to `$07FF` (2,047). On a modern machine you would expect row `r` to start at `$0400 + r * 40`. It does not. The rows are interleaved in groups of 8. This interleaving is not a bug and not a compression trick -- it falls directly out of how the Apple II video hardware generated memory addresses using the minimum number of logic chips. Any program that wants to write to the screen, including the monitor ROM's `COUT` routine, has to know the interleave pattern. `textRowAddr` is the function that encodes that pattern.
+The Apple II keyboard is radically different from a modern keyboard. It is
+uppercase-only and has no concept of key release. Its arrow keys produce
+control codes (`$08`, `$0B`, `$0A`, `$15`), not separate "cursor" events.
+Its shift key produces a specific set of shifted characters that do not
+exactly match a modern US keyboard layout. This function is the translation
+layer between two keyboard worlds separated by nearly 50 years of hardware
+evolution.
 
 ### How the Code Works
 
-The formula:
+The function has three code blocks, each handling a different category of
+input.
 
-```
-address = $0400 + (row / 8) * $28 + (row % 8) * $80
-```
+**Block 1 -- Control key combinations (lines 177-181)**:
 
-- `row / 8` gives the **group index** (0, 1, or 2) -- which group of 8 rows this row belongs to.
-- `row % 8` gives the **position within the group** (0 through 7).
-- `$28` = 40 decimal = the width of one text row in bytes. Moving from group 0 to group 1 to group 2 adds one row's worth of bytes.
-- `$80` = 128 decimal. Rows within a group are 128 bytes apart in memory.
-
-The full 24-row address table (Diagram 4):
-
-```
-  Row   Group   Within-group   Formula                    Address (hex)   Decimal
-  ---   -----   ------------   ------------------------   -------------   -------
-    0     0          0         $0400 + 0*$28 + 0*$80        $0400          1024
-    1     0          1         $0400 + 0*$28 + 1*$80        $0480          1152
-    2     0          2         $0400 + 0*$28 + 2*$80        $0500          1280
-    3     0          3         $0400 + 0*$28 + 3*$80        $0580          1408
-    4     0          4         $0400 + 0*$28 + 4*$80        $0600          1536
-    5     0          5         $0400 + 0*$28 + 5*$80        $0680          1664
-    6     0          6         $0400 + 0*$28 + 6*$80        $0700          1792
-    7     0          7         $0400 + 0*$28 + 7*$80        $0780          1920
-    8     1          0         $0400 + 1*$28 + 0*$80        $0428          1064
-    9     1          1         $0400 + 1*$28 + 1*$80        $04A8          1192
-   10     1          2         $0400 + 1*$28 + 2*$80        $0528          1320
-   11     1          3         $0400 + 1*$28 + 3*$80        $05A8          1448
-   12     1          4         $0400 + 1*$28 + 4*$80        $0628          1576
-   13     1          5         $0400 + 1*$28 + 5*$80        $06A8          1704
-   14     1          6         $0400 + 1*$28 + 6*$80        $0728          1832
-   15     1          7         $0400 + 1*$28 + 7*$80        $07A8          1960
-   16     2          0         $0400 + 2*$28 + 0*$80        $0450          1104
-   17     2          1         $0400 + 2*$28 + 1*$80        $04D0          1232
-   18     2          2         $0400 + 2*$28 + 2*$80        $0550          1360
-   19     2          3         $0400 + 2*$28 + 3*$80        $05D0          1488
-   20     2          4         $0400 + 2*$28 + 4*$80        $0650          1616
-   21     2          5         $0400 + 2*$28 + 5*$80        $06D0          1744
-   22     2          6         $0400 + 2*$28 + 6*$80        $0750          1872
-   23     2          7         $0400 + 2*$28 + 7*$80        $07D0          2000
+```go
+if mod&sdl.KMOD_CTRL != 0 {
+    if sym >= sdl.K_a && sym <= sdl.K_z {
+        return uint8(sym-sdl.K_a) + 1
+    }
+}
 ```
 
-Two observations worth calling out explicitly:
+When the Control modifier is held, letters A through Z map to ASCII control
+characters 1 through 26. The arithmetic: `sym - sdl.K_a` produces 0 for A, 1
+for B, ..., 25 for Z. Adding 1 shifts the range to 1-26, matching the ASCII
+control character block (`Ctrl+A` = SOH = 1, `Ctrl+B` = STX = 2, ...,
+`Ctrl+Z` = SUB = 26). These are the control codes the Apple II ROM uses for
+terminal control: `Ctrl+H` is backspace, `Ctrl+M` is return, `Ctrl+G` is
+bell, etc.
 
-**Visually adjacent rows are far apart in memory; visually distant rows are close together.** Row 0 is at `$0400` and row 1 is at `$0480` -- 128 bytes apart even though they are one scanline apart on the screen. Meanwhile row 8 at `$0428` is only 40 bytes after row 0 at `$0400` -- they are neighbors in the memory listing but eight scanlines apart on the display. A simple `base + row * 40` loop would put every row after the first in the wrong place.
+**Block 2 -- Special keys (lines 184-201)**:
 
-**The three groups of 8 rows leave "screen holes" that peripheral cards use as scratch.** 24 divides evenly into three groups of 8, and the group stride `$28` (40 bytes) is exactly one row width. The entire 24-row screen fits within `$0400`-`$07F7` with a handful of unused bytes at the ends of certain rows (`$0478`-`$047F`, `$04F8`-`$04FF`, etc.) that the original hardware repurposed as scratch space for peripheral cards.
+A `switch` statement maps named keys to their Apple II equivalents:
 
-**The hardware reason in one paragraph**: the Apple II's video scanner generates memory addresses directly from the horizontal and vertical counters using bit-level wiring, not multiplication. Specific address bits -- particularly A7 and A9 -- are driven by the vertical counter with a staggered pattern, while A0-A6 are driven by the horizontal column counter. Woz chose the bit mapping that required the fewest 7400-series logic chips. Multiplication would have required a real ALU; bit-wiring required half a 74LS chip. The interleave is the shadow that design choice casts across every programmer who has ever touched the Apple II screen. Applesoft BASIC and the monitor ROM both carry a hardcoded row-address table because computing the formula on every character access would be too slow at 1 MHz.
+- Return and KP Enter: `$0D` (13) -- carriage return
+- Backspace: `$08` (8) -- same as the left arrow on the Apple II
+- Delete: `$7F` (127) -- the "rubout" character
+- Left arrow: `$08` (8) -- the Apple II left arrow IS backspace; the
+keyboard had a single key labeled `<--` (delete/backspace) rather than
+separate left-arrow and backspace keys
+- Right arrow: `$15` (21) -- this is `Ctrl+U` in ASCII, which the Apple II
+ROM uses for cursor right
+- Up arrow: `$0B` (11) -- `Ctrl+K`, vertical tab
+- Down arrow: `$0A` (10) -- `Ctrl+J`, line feed
+- Tab: `$09` (9) -- `Ctrl+I`, horizontal tab
+
+**Block 3 -- Printable ASCII (lines 203-263)**:
+
+For characters in the printable ASCII range (codes 32-126), the function
+applies two transformations. If Shift is held, lowercase letters are
+uppercased (`ch -= 32`), and number/punctuation keys are mapped to their
+shifted symbols via a manual lookup table (e.g., `'1'` becomes `'!'`, `'2'`
+becomes `'@'`, etc.). If Shift is not held, the Apple II's uppercase-only
+nature is enforced by auto-converting any lowercase letter to uppercase.
+
+**Known limitation**: The shift table maps `[` to `{`, `]` to `}`, `\` to
+`|`, and backtick to `~`. These characters (`{`, `}`, `|`, `~`) do not exist
+on the Apple II+ keyboard and their character codes (`$7B`, `$7D`, `$7C`,
+`$7E`) are not defined in the Apple II character ROM. If these codes reach
+the Apple II, the ROM will display unexpected characters or garbage. This is
+a known issue.
+
+For the character encoding zones (`$00`-`$3F`, `$40`-`$7F`, `$80`-`$FF`)
+that Apple II key codes must fall into, see walkthrough_chargen.md Section
+3.
+
+### Diagram 7: Apple II Keyboard Code Map
+
+```
+  SDL Event                  Apple II Code    Notes
+  -------------------------  ---------------  --------------------------
+  Return / KP Enter          $0D (13)         Carriage return
+  Backspace                  $08 (8)          Same as Left arrow
+  Left arrow                 $08 (8)          Apple II has no "left" key
+  Right arrow                $15 (21)         Ctrl+U on Apple II
+  Up arrow                   $0B (11)         Ctrl+K on Apple II
+  Down arrow                 $0A (10)         Line feed / Ctrl+J
+  Tab                        $09 (9)          Ctrl+I on Apple II
+  Delete                     $7F (127)        Rubout
+  Escape                     (quits emulator, not sent to Apple II)
+  Ctrl+A..Z                  $01..$1A (1..26) ASCII control range
+  A..Z (unshifted)           $41..$5A         Auto-uppercased
+  a..z (SDL lowercase)       $41..$5A         Auto-uppercased
+  0..9 (shifted)             !@#$%^&*()       Standard US layout
+  Space                      $20 (32)         Passes through as-is
+```
 
 ### Real-World Analogy
 
-> Imagine a theater where Row 1 is at the front, Row 2 is behind the balcony, Row 3 is backstage, Row 4 is up a ladder, Row 5 is on the roof, and Row 6 is in the lobby. You cannot walk in and count rows by number -- you need a seat map. The Apple II screen memory is laid out the same way: you cannot loop `addr = start + row*40`. You need a lookup. The `textRowAddr` function IS that seat map, compressed into three arithmetic operations. The hardware engineer who designed this seating chart was not a sadist; he was trying to save parts. Every chip he did not put on the motherboard shaved cost off the list price, and in 1977 that was the difference between a computer people could afford and a computer only labs could afford.
+A diplomatic interpreter who translates between two very different languages
+-- and also edits the message as they translate. Lowercase words are
+converted to uppercase (the Apple II does not understand lowercase). Arrow
+keys become control-code sequences (the Apple II's native directional
+vocabulary). Keys with no Apple II equivalent are dropped entirely (return
+value 0: "I cannot translate this"). And a few mistranslations slip through
+(the symbols `{`, `}`, `|`, `~`) because the interpreter was trained on a
+slightly wrong glossary.
+
+**Cross-references:**
+- walkthrough_io.md Section 3b (keyboard registers `$C000`/`$C010`, strobe
+bit, how `PressKey` data becomes readable by the ROM)
+- walkthrough_io.md Section 5 (PressKey method)
+- walkthrough_chargen.md Section 3 (Apple II character encoding zones that
+key codes must land in)
 
 ---
 
-## Section 5: `init()` and the Disassembler Tables (lines 155-350)
+## Section 5: `loadROM` -- Size Detection (lines 268-287)
 
 ### What It Is
 
-```go
-var opNames [256]string
-var opSizes [256]uint8
-
-func init() {
-    for i := range opNames {
-        opNames[i] = "???"
-        opSizes[i] = 1
-    }
-
-    n := func(op byte, name string, size uint8) {
-        opNames[op] = name
-        opSizes[op] = size
-    }
-
-    // Load/Store
-    n(0xA9, "LDA", 2)
-    n(0xA5, "LDA", 2)
-    // ... (151 entries across 13 instruction groups)
-    n(0xEA, "NOP", 1)
-    n(0x00, "BRK", 1)
-}
-```
+`loadROM` (lines 268-287) is a helper function that reads a ROM file from
+disk and determines the correct base address from the file size. It returns
+a `*memory.ROM` ready to be mapped onto the bus.
 
 ### Why It Matters
 
-The trace loop in `main()` needs two pieces of information for every opcode it encounters:
-1. A human-readable mnemonic (`LDA`, `JMP`, `BNE`, etc.).
-2. How many bytes the instruction occupies, so the raw-bytes column of the trace shows exactly 1, 2, or 3 bytes correctly.
-
-A static 256-entry array is the simplest, fastest possible answer: O(1) lookup, no hash, no function call, trivial to audit.
+The Apple II+ ROM is 12 KB, mapped at `$D000`-`$FFFF` (53,248-65,535). Many
+ROM dumps available online are 16 KB, covering `$C000`-`$FFFF`
+(49,152-65,535) and including the slot ROM area. A user should not need to
+know which format they have -- the emulator detects it automatically.
 
 ### How the Code Works
 
-**The package-level arrays**: `[256]string` and `[256]uint8`. The fixed size of 256 matches the opcode space exactly -- a byte has exactly 256 possible values, so one array entry per possible opcode. These are arrays (fixed-size, value type), not slices (dynamic). The size is known at compile time and never changes. Go zero-initializes arrays: `opNames` starts with all empty strings, `opSizes` starts with all zeros. Both get overwritten by `init()`.
+The function calls `os.Stat(path)` to get the file size without opening the
+file. Then a `switch` on the size selects the base address:
 
-**Go's `init()` mechanism**: any function in a Go package named `init()` with no parameters and no return value is a package initializer. The Go runtime runs all `init()` functions in a package before `main()` begins, exactly once, automatically. You cannot call `init()` manually; it is not an ordinary function. A package can have multiple `init()` functions spread across multiple source files, and they run in the order the files are compiled (roughly alphabetical). The `init()` mechanism exists precisely for cases like this one: setting up package-level state that cannot be expressed as a simple variable initializer because it requires a loop or conditional logic.
+- 12,288 bytes (12 KB): base = `$D000` (53,248)
+- 16,384 bytes (16 KB): base = `$C000` (49,152)
+- Any other size between 1 and 12,288 bytes: base = `0x10000 - size`,
+placing the ROM at the top of the 64 KB address space regardless of exact
+length
+- Any other size: return a descriptive error
 
-**The default-fill loop**: before filling known opcodes, `init()` writes `"???"` into every slot and size `1` into every slot. This default matters in two ways. Any unknown or illegal opcode prints as `???` -- a clear signal in the trace that something unexpected is executing. Default size `1` is the safest fallback: it ensures the trace loop does not accidentally consume operand bytes from the next instruction when it encounters an unknown opcode.
+The function body is essentially identical to Phase 3's `loadROM`. The only
+difference is the error message: Phase 4 removes the multi-line "Common ROM
+sizes" help text that appeared in Phase 3's error output. For the full
+explanation of the size logic, ROM overlap mechanics, and the
+`memory.LoadROM` / `ROM.Base` / `ROM.End()` internals, see
+walkthrough_main_phase3.md Section 3 and walkthrough_memory.md Section 3.
 
-**The `n` closure**: this is the most elegant line in the file. `n := func(op byte, name string, size uint8) { opNames[op] = name; opSizes[op] = size }` creates a local function and binds it to the name `n`. The closure captures `opNames` and `opSizes` from the enclosing `init()` scope -- it can read and write those arrays directly. Instead of writing two array assignments per opcode (`opNames[0xA9] = "LDA"` and `opSizes[0xA9] = 2`), every entry becomes a single compact call (`n(0xA9, "LDA", 2)`). The closure exists only for the duration of `init()` and goes out of scope when `init()` returns. This is the DRY principle at its simplest: define the repetitive action once, then call it.
-
-**Instruction groups**: the 151 entries are organized into 13 groups following the traditional 6502 instruction reference grouping: Load/Store, Transfers, Stack, Arithmetic, Logic, Shift/Rotate, Inc/Dec, Compare, Bit, Branches, Jump, Flags, and Misc. This mirrors the layout of a 6502 reference card. To audit the table, open a 6502 reference next to the file and check each group sequentially.
-
-**The LDA group as a worked example**: LDA alone has 8 entries because there are 8 addressing modes that can load the accumulator, each with a different opcode byte:
-
-```go
-n(0xA9, "LDA", 2) // LDA immediate    -- 2 bytes: opcode + immediate value
-n(0xA5, "LDA", 2) // LDA zero page    -- 2 bytes: opcode + zero page address
-n(0xB5, "LDA", 2) // LDA zero page,X  -- 2 bytes: opcode + zero page address
-n(0xAD, "LDA", 3) // LDA absolute     -- 3 bytes: opcode + lo byte + hi byte
-n(0xBD, "LDA", 3) // LDA absolute,X   -- 3 bytes
-n(0xB9, "LDA", 3) // LDA absolute,Y   -- 3 bytes
-n(0xA1, "LDA", 2) // LDA (zp,X)       -- 2 bytes: opcode + zero page address
-n(0xB1, "LDA", 2) // LDA (zp),Y       -- 2 bytes: opcode + zero page address
-```
-
-Same mnemonic, 8 different opcodes, two different lengths. The 6502 instruction set has this quality throughout -- the same operation encoded with different addressing modes produces different opcode bytes and sometimes different operand lengths. The table stores only what the trace loop needs: the mnemonic string and the total byte count.
-
-**Coverage**: 151 of 256 possible opcode slots are filled. The remaining 105 slots are either unused holes in the 6502 instruction set or "illegal" (undocumented) opcodes that the Apple II+ ROM firmware never executes. Any `???` in the trace output is a strong signal that something has gone wrong -- the CPU is either reading from uninitialized RAM or executing code at a wrong address.
-
-**Why arrays instead of a map**: a `map[byte]string` would also work, but it has higher overhead: hash computation, memory allocation, and a `, ok` check pattern to distinguish "unknown opcode" from "key not present." A 256-entry fixed array is O(1), bounds-checked by the compiler for compile-time constants, and zero-cost to access after initialization. For a table this small with constant access patterns, the array is unambiguously the right choice.
-
-**Important scope note**: the disassembler deliberately does NOT decode addressing modes or format operand values. A full disassembler would recognize opcode `$A9` as `LDA immediate` and format the following byte as `#$42`, or recognize `$AD` as `LDA absolute` and format the next two bytes as `$1234`. Our table stores only the mnemonic and the raw length. The trace loop prints the raw operand bytes separately. This is a phase-3 choice: the output is readable enough for a developer debugging a boot sequence, and the table is simple enough to verify in five minutes.
-
-### Real-World Analogy
-
-> The disassembler table is a traveler's pocket phrasebook. It does not teach grammar or conjugation; it gives you just enough to get by -- "hello," "thank you," "where is the train." When you see `$A9 42` flash by in the trace, the phrasebook does not translate it into "load the accumulator with the immediate value 66 decimal"; it just says `LDA` and shows you the raw bytes. You recognize the pattern, you check the reference card if you need more, and you move on. A full disassembler would be a dictionary and a grammar textbook. This is a phrasebook, and phrasebooks fit in a pocket.
+**Cross-references:**
+- walkthrough_main_phase3.md Section 3 (full loadROM explanation, error
+message comparison)
+- walkthrough_memory.md Section 3 (ROM struct, LoadROM function, Base field,
+End() method)
 
 ---
 
-## Section 6: Putting It Together -- The Phase 3 Boot Flow
+## Section 6: Putting It Together -- The Phase 4 Boot and Run Flow
 
-We have walked every line; now let us watch the file run from the first shell keystroke to the exit code.
+Reading `main.go` linearly is straightforward, but it helps to see the full
+sequence as a timeline to understand why the order matters.
 
-### Boot Timeline (Diagram 5)
+### Diagram 8: Phase 4 Boot Timeline
 
 ```
-  Step   Actor           Action                                    Effect
-  ----   -------------   ---------------------------------------   ----------------------------------
-    1    Go runtime      init() runs (from Section 5)             opNames / opSizes tables filled
-    2    Go runtime      main() begins
-    3    main            flag.Parse()                              romPath, traceCount set
-    4    main            loadROM("roms/apple2plus.rom")            rom built, Base = $D000
-    5    main            memory.NewRAM()                           64 KB zeroed RAM created
-    6    main            appleio.NewSoftSwitches()                 sw created, TextMode = true
-    7    main            bus.New()                                 empty bus b created
-    8    main            b.Map($0000, $BFFF, ram)                  base RAM layer
-    9    main            b.Map($C000, $C0FF, sw)                   softswitch overlay
-   10    main            b.Map($D000, $FFFF, rom)                  ROM overlay
-   11    main            b.Dump()                                  bus map printed to stdout
-   12    main            cpu.NewCPU(b)                             CPU wired to bus
-   13    main            c.Reset()                                 PC = *$FFFC (e.g. $FF59)
-   14    main            print reset vector                        diagnostic print
-   15    main            enter trace loop
-   16    CPU             Step() x N                                hundreds of instructions traced
-   17    main            detects PC == prevPC three times          prints stuck message, breaks
-   18    main            prints final register state               post-mortem dump
-   19    main            prints first 3 text-screen rows           raw hex preview
-   20    Go runtime      main() returns                            exit code 0
+  Time -->
+
+  1. Parse flags          flag.Parse()
+  2. Load ROM             loadROM("roms/Apple2_Plus.rom")
+  3. Create devices       NewRAM(), NewSoftSwitches(), NewBus()
+  4. Wire bus             Map(RAM), Map(I/O), Map(ROM)
+  5. Create CPU           NewCPU(bus), Reset()    -- reads $FFFC/$FFFD
+  6. Create video         NewVideo(ram.Data[:])   -- direct RAM link
+  7. Init SDL             Init, Window, Renderer, Texture
+  8. Print banner         "Apple II Emulator -- Iteration 3"
+  9. Enter main loop      for running { ... }     -- runs at 60 fps
+     |
+     +-- per frame:
+         a. Poll events       sdl.PollEvent -> sdlKeyToApple -> sw.PressKey
+         b. Run CPU           17,050 cycles (c.Step loop)
+         c. Render video      vid.RenderText()
+         d. SDL present       texture.Update -> Clear -> Copy -> Present
+         e. Frame timing      vsync or sdl.Delay fallback
 ```
+
+The ordering is significant:
+- The ROM must be loaded before the bus is wired (you need `rom.Base` to
+call `b.Map`).
+- The bus must be wired before the CPU is created (the CPU takes the bus as
+a constructor argument).
+- The CPU must be created before `Reset()` is called (obvious, but
+`c.Reset()` reads through the bus, so the ROM must also be on the bus
+already).
+- The video renderer must be created after RAM (it holds a reference to
+`ram.Data[:]`), but it does not need the bus, CPU, or SDL to exist yet.
+- SDL must be initialized before creating any SDL resources (window,
+renderer, texture).
+- The main loop begins only after all resources are successfully created; if
+any step fails, the program exits before entering the loop.
 
 ### Forward Pointer Roundup
 
-Every previous walkthrough in this series contained a forward pointer to `main.go`. Here is where each one lands:
+Every walkthrough in the series ended with forward pointers that said "this
+will matter when main.go wires it together." Here is where each one lands:
 
-- **Memory walkthrough, "How the Bus Stacks These"**: closed by the three `b.Map` calls in sub-section 2d. The "stacking" is the layer-by-layer registration of RAM, then softswitches, then ROM -- each call adding one more device to the scan list.
+| Source Walkthrough | Forward Pointer | Where It Lands in Phase 4 |
+|---|---|---|
+| walkthrough_bus.md Section 10 | "bus only useful when main.go wires it" | Sub-section 3b (three Map calls) |
+| walkthrough_io.md Section 8 | "main.go is the wiring diagram" | Sub-section 3b (Map($C000, $C0FF, sw)) |
+| walkthrough_io.md Section 6 Step 7 | "video renderer will consult TextMode/HiRes" | **NOT YET CLOSED** -- see below |
+| walkthrough_video.md Section 7 | "For the full SDL window setup... see walkthrough_main_phase3.md Section 2" | This walkthrough, Sub-section 3e/3f (Phase 3 reference now stale) |
+| walkthrough_video.md Section 7 | "texture.Update pitch" | Sub-section 3f Phase 4 (SDL present) |
+| walkthrough_bus.md Section 4 | *(contextual mention)* "Ordering responsibility belongs with the caller (main.go)" | Sub-section 3b (Map order) -- factual observation, not a true forward pointer |
+| walkthrough_chargen.md Section 7 | "Forward pointer to walkthrough_video.md" | Closed by walkthrough_video.md, not main |
+| walkthrough_memory.md Section 6 | "Forward reference to bus walkthrough" | Closed by walkthrough_bus.md, not main |
 
-- **Bus walkthrough, "the bus only becomes useful when main.go wires it up"**: closed by the entirety of sub-section 2d. The bus was described as an empty router; here is where it acquires its three devices and becomes a functioning address space.
+**The open forward pointer**: The io walkthrough (walkthrough_io.md Section
+6, Step 7) says: "the video renderer (not yet in this codebase) will consult
+`TextMode` and `HiRes` on every frame to decide how to draw the screen." Two
+things to note:
 
-- **Bus walkthrough Section 7 (Dump)**: closed by sub-section 2e. `b.Dump()` runs right after the three Map calls and prints the assembled memory map before the first instruction executes.
+1. The aside "(not yet in this codebase)" is now stale -- the `video`
+package exists in Phase 4.
+2. The substance of the forward pointer is still unresolved. Phase 4 calls
+`vid.RenderText()` unconditionally on every frame. The `TextMode` and
+`HiRes` softswitches are tracked by the `SoftSwitches` struct, but the video
+renderer does not read them. This forward pointer will be closed in a future
+phase when the video renderer gains a `Render(sw)` signature that dispatches
+to text, lo-res, or hi-res rendering based on softswitch state.
 
-- **Bus walkthrough Section 8 (Putting It Together)**: closed by sub-section 2d's description of how last-match-wins overlay order is determined by Map call sequence.
-
-- **I/O walkthrough, "main.go is the wiring diagram"**: closed by the `b.Map(0xC000, 0xC0FF, sw)` line -- the moment the softswitch window joins the bus and reads in that region start triggering hardware state changes.
-
-- **I/O walkthrough Section 6 (Putting It Together, bus call chain)**: closed by sub-section 2d's walkthrough of how the bus routes reads at `$C000`-`$C0FF` to the softswitch block instead of RAM.
-
-- **CPU walkthrough Section 5 (New and Reset)**: closed by `c.Reset()` and the reset-vector print in sub-section 2f. The CPU walkthrough described what `Reset` does; here is the call site.
-
-- **CPU walkthrough Section 6 (Step, fetch-decode-execute)**: closed by `c.Step()` inside the trace loop in sub-section 2g. The CPU walkthrough described the entire execution cycle; here is where it runs against a real ROM.
-
-- **cpu_test walkthrough (Klaus Dormann trap detection)**: closed by the stuck-loop detector in sub-section 2g. The same "if PC did not move, we are stuck" pattern used in the test harness to detect the Klaus Dormann test ROM's final idle loop appears here as the production emulator's safety valve.
-
----
-
-## Section 7: Design Decisions and Phase 3 Trade-offs
-
-**Q1: Why does `main.go` have a trace loop instead of a real interactive REPL?**
-
-Phase 3 is focused on boot correctness, not interactivity. A trace of the first 200-500 instructions answers the questions a developer actually has at this stage: does the ROM start? does the monitor initialize? does the text screen get cleared? A "running..." display would hide all of that behind a blank screen. Interactive keyboard input and a real video renderer belong to phase 4; they require a frame loop, a host-side input source, an event model, and a plan for pacing the CPU against wall-clock time. Phase 3 deliberately skips all of that complexity and gives you something you can read and reason about: a timestamped execution trace.
-
-**Q2: Why is the text screen previewed via direct `ram.Data[base+col]` instead of `b.Read`?**
-
-Both would work and produce identical results. Direct access skips the bus scan, which is marginally faster and slightly more self-documenting in context: after the CPU has stopped executing, nothing can overlay or change the RAM contents, so going straight to the backing store is reasonable. Using `b.Read(base + uint16(col))` would be equally valid and arguably more consistent in spirit -- it routes the read through the same path the CPU uses. The direct access is a style preference, not a correctness requirement. Either way, you read the same bytes.
-
-**Q3: Why alias `io` to `appleio` instead of importing it with its natural name?**
-
-Go's standard library has a package named `io` -- it defines `Reader`, `Writer`, and other stream interfaces that appear constantly in Go code. Even though `main.go` does not currently import stdlib `io`, any future code that adds it would collide with our `github.com/apple2emu/io` if both used the natural short name `io`. Aliasing our package as `appleio` lets both coexist forever. It is a one-line defensive move at the import site that costs nothing and eliminates an entire category of future refactoring pain.
-
-**Q4: Why does the trace loop peek at `pc+1` and `pc+2` bytes that might not be part of the current instruction?**
-
-**There is one honest gotcha lurking here**: reads in the softswitch window `$C000`-`$C0FF` (49,152-49,407) have side effects. If PC ever pointed into that region and we peeked at `pc+1` or `pc+2`, those peeks could trigger softswitch state changes -- for example, advancing the keystrobe, toggling a graphics mode. Cross-reference the I/O walkthrough Section 3 (Read with side effects) for the full mechanism. A phase-4 rewrite of the trace loop might want a "read without side effects" helper, or at least a bounds check on PC before issuing peeks.
-
-In the common case the peek is safe, which is why phase 3 gets away with it: reads from RAM and ROM have no side effects, and the `size`-guarded `switch` ensures the peeked bytes are only printed when they genuinely belong to the instruction. A 1-byte instruction reads but ignores `b1` and `b2`. In normal Apple II boot execution, PC lives in ROM (`$D000`-`$FFFF`) or RAM (`$0000`-`$BFFF`), never in the I/O window -- so the hazard never actually fires during a typical boot trace. Calling it out honestly is cheaper than burying it.
-
-**Q5: Why print the reset vector manually with `b.Read($FFFC) | b.Read($FFFD)<<8` instead of just printing `c.PC` after `Reset()`?**
-
-`c.PC` already holds the correct address after `c.Reset()` and would be cheaper to print. The manual read-and-assemble serves a pedagogical purpose: the trace output explicitly shows the two bytes at `$FFFC`/`$FFFD`, which reminds the reader of the reset-vector convention. Anyone reading a saved trace can see both the raw bytes and the assembled address in one line of output, without needing to look them up separately. It is a diagnostic choice, not a correctness requirement.
-
-**Q6: Why is the stuck-loop threshold 3 instead of 1?**
-
-A single same-PC-twice observation could fire on a legitimate branch sequence that briefly revisits an address -- unusual but not impossible in tight initialization loops. Requiring three consecutive same-PC observations is a low-cost safety margin. Almost no real code executes at the same PC three times in a row unless it is genuinely spinning. The Klaus Dormann test harness uses the same basic idea with a similarly conservative threshold. Three was enough to avoid false positives in early testing of this emulator; if a future ROM shows a false positive at 3, bumping to 4 or 5 is a one-character edit.
+Note for readers of walkthrough_video.md: Section 7 of that walkthrough
+references "walkthrough_main_phase3.md Section 2" for the SDL window setup.
+That reference is now superseded. The SDL setup is in Sub-section 3e of this
+walkthrough (`walkthrough_main.md`).
 
 ---
 
-## Section 8: Summary and Phase Roadmap
+## Section 7: Design Decisions and Phase 4 Trade-offs
 
-`main.go` at phase 3 is a 350-line bootstrap harness. It parses two flags, loads a ROM with automatic size detection, wires RAM, softswitches, and ROM onto a bus in an order that makes last-match-wins do the right thing, boots a CPU against the bus, reads the reset vector, and traces up to 200 instructions while disassembling each one and watching for JMP-to-self stuck loops. When the trace ends -- by count or by detection -- it prints the final register state and a raw hex preview of the first three text-screen rows, then exits. Every promise the previous walkthroughs made about how the pieces would come together lands in this one file.
+**Q1: Why does the video renderer bypass the bus and read RAM directly?**
 
-> `main.go` is the smallest file in the project that actually decides anything. Everything else is a reusable component -- `cpu.CPU`, `memory.RAM`, `memory.ROM`, `bus.Bus`, `io.SoftSwitches` -- each of which could be lifted out and dropped into a different emulator. `main.go` is the one file where the emulator takes a position. It says: "this is an Apple II+, with a 12 KB ROM at `$D000`, a softswitch window at `$C000`, 48 KB of RAM, and a trace-driven boot harness." Change `main.go` and you change which machine you are emulating. Leave the rest alone.
+Two reasons. First, performance: the text page is 960 bytes (40 columns x 24
+rows), and rendering it at 60 fps would require 57,600 bus read dispatches
+per second. Each dispatch scans a mapping slice, which is fast but not free.
+Direct RAM access eliminates the overhead. Second, correctness: text page 1
+at `$0400`-`$07FF` (1,024-2,047) is always in unbanked RAM for an Apple II+
+-- there is no configuration where this region is remapped to something
+else.
 
-### Phase 3 vs Future Phases (Diagram 6)
+The trade-off is tight coupling between the video renderer and the
+`memory.RAM` struct. When the emulator later implements bank switching (the
+language card), the video renderer will need to be updated to understand
+which 64 KB "view" of RAM is active. For a full discussion, see
+walkthrough_video.md Section 8 Q1.
 
-```
-  Feature                          Phase 3                Future phases
-  -------------------------------  ---------------------  ----------------------------------
-  Flag parsing                     yes                    yes (more flags)
-  ROM loading with size detection  yes                    yes
-  Bus wiring                       three Map calls        add slot ROMs, language card
-  CPU trace with disassembly       yes (151 opcodes)      optional debug tool only
-  Stuck-loop detection             yes                    yes (keep as safety valve)
-  Text screen raw hex preview      yes                    replaced by real renderer
-  Interactive keyboard loop        no                     yes (terminal raw mode or SDL)
-  Video renderer                   no                     yes (text + lores + hires + page 2)
-  Audio output                     no                     yes (speaker toggle -> PCM)
-  Disk II slot 6                   no                     yes (WOZ or DSK images)
-  Bank switching / language card   no                     yes (via bus overlays)
-  Save/load state                  no                     maybe
-  TUI or GUI frontend              no                     maybe
-```
+**Q2: Why are some CGo constants explicitly cast and others are not?**
 
-### What's Next
+The `go-sdl2` library wraps C `#define` macros via CGo. When passed to Go
+functions that require explicit types (`uint32`, `int32`), these constants
+may fail to compile without a cast. The current code has explicit
+`uint32(...)` casts on `INIT_VIDEO`, `INIT_EVENTS` (line 66), and
+`PIXELFORMAT_RGBA32` (line 96). Other SDL constants (`WINDOWPOS_CENTERED`,
+`WINDOW_SHOWN`, `RENDERER_ACCELERATED`, `RENDERER_PRESENTVSYNC`,
+`TEXTUREACCESS_STREAMING`, and all the `K_*` keycodes and `KMOD_*`
+modifiers) appear bare and compile on the current platform (Go 1.21,
+darwin/arm64).
 
-With `main.go` walked, the core-code walkthrough series is complete. Future walkthroughs could cover the bus and io test files, or the series could pause here until phase 4 adds enough new code to warrant a new chapter.
+Whether a bare CGo constant compiles depends on the context in which it is
+used and can vary across Go versions and platforms. The safest practice is
+to always wrap SDL constants in an explicit cast matching the target type.
+The rule is: **when in doubt, cast**.
+
+**Q3: Why is the main loop single-threaded instead of using goroutines?**
+
+SDL2 is not thread-safe; all SDL calls must happen on the main OS thread. On
+macOS, this is enforced by the OS itself -- SDL's window creation will fail
+or crash if called from a non-main thread. Even on platforms where SDL is
+more lenient, a single-threaded game loop is the standard SDL2 pattern.
+Goroutines would require synchronization channels for every SDL call, adding
+complexity with no benefit: the bottleneck is the 16.67ms frame budget, not
+Go's scheduler.
+
+**Q4: Why use `sdl.Delay()` as the vsync fallback instead of `time.Sleep()`?**
+
+`sdl.Delay()` is SDL's own timing function, designed to cooperate with its
+event system and be accurate on all SDL-supported platforms. `time.Sleep()`
+would likely work in practice on most systems, but `sdl.Delay()` is the
+idiomatic choice for SDL applications and avoids any potential interaction
+between Go's goroutine scheduler and SDL's internal timing on exotic
+platforms. The primary timing mechanism is vsync via
+`RENDERER_PRESENTVSYNC`; the manual delay is only a safety net for
+environments where vsync is unavailable or broken.
+
+**Q5: Why does `sdlKeyToApple` generate shifted symbols that do not exist on
+the Apple II?**
+
+The shift table maps `[` to `{`, `]` to `}`, `\` to `|`, and backtick to
+`~`. These characters are not present on the Apple II+ keyboard and their
+character ROM entries produce unexpected glyphs. This is a known issue (no
+`{` key on an Apple II+ means there is no legitimate way to input this
+code). A clean fix would be to not generate these codes, or to filter out
+any key code above `$5F` (95) that does not correspond to a valid Apple II
+character. The current code is permissive and simply passes these codes
+through to the softswitch layer.
+
+**Q6: Why is there no error recovery for CPU panics?**
+
+If the CPU encounters an opcode that is not yet implemented, `c.Step()` will
+call `panic()`, crashing the emulator with a Go stack trace. Phase 4 does
+not wrap the CPU step loop in a `recover()` block. This is an intentional
+development trade-off: a crash with a full stack trace identifies the
+unimplemented opcode immediately, while silent failure or a black screen
+would be harder to debug. A future phase could add a `defer recover()` block
+that catches CPU panics and displays an on-screen error message.
+
+**Q7: Why does `RenderText()` re-render the entire screen every frame?**
+
+Dirty-rectangle tracking -- only re-rendering the cells whose underlying
+text bytes changed -- would reduce GPU load but would add considerable
+complexity: the video renderer would need to compare the current text page
+against a cached copy on every frame. At 280x192 pixels with 4 bytes per
+pixel, the total pixel buffer is 215,040 bytes, and copying that to the GPU
+via `texture.Update` is trivial on modern hardware. The simplicity of always
+rendering everything outweighs the minimal performance savings of dirty
+tracking. See walkthrough_video.md Section 8 Q7 for a fuller discussion.
+
+---
+
+## Section 8: Summary and What Is Next
+
+`main.go` is 287 lines that assemble a working Apple II emulator from six
+packages. It loads a ROM file, maps three devices onto an address bus,
+creates a 6502 CPU and boots it from the ROM's reset vector, initializes an
+SDL2 window with a 280x192 streaming texture, and enters a 60fps loop that
+polls keyboard events, executes 17,050 CPU cycles per frame, renders the
+Apple II text screen into an RGBA32 pixel buffer, and presents that buffer
+to the display. Every line has a clear purpose. Every package has a single
+responsibility.
+
+> **Take-home idea**: `main.go` is a wiring diagram, not an algorithm. Its
+> job is to instantiate components (RAM, ROM, bus, CPU, I/O, video, SDL) and
+> connect them in the right order. The main loop is a five-phase pipeline
+> (poll, execute, render, present, wait) that repeats 60 times per second.
+> The emulator's intelligence lives in the packages; `main.go` just starts
+> the machine and turns the crank.
+
+### Quick Reference
+
+| Item | Value |
+|---|---|
+| File | `main.go` |
+| Lines | 287 |
+| Phase | 4 (SDL interactive emulator) |
+| CPU clock | 1,023,000 Hz (1.023 MHz) |
+| Target FPS | 60 |
+| Cycles per frame | 17,050 |
+| Window size | 840 x 576 (3x native) |
+| Native resolution | 280 x 192 |
+| SDL texture format | RGBA32 (streaming) |
+| Pixel buffer size | 215,040 bytes (280 x 192 x 4) |
+| Key mapping function | `sdlKeyToApple` (lines 170-266) |
+| ROM auto-detection | 12 KB -> $D000 (53,248), 16 KB -> $C000 (49,152) |
+| Bus devices | RAM ($0000-$BFFF), I/O ($C000-$C0FF), ROM ($D000-$FFFF) |
+| CPU reset vector | $FFFC-$FFFD (65,532-65,533) |
+| Frame timing | VSync primary, sdl.Delay fallback |
+| Ctrl+R | CPU reset |
+| Escape | Quit emulator |
+| Packages used | 5 internal (bus, cpu, io, memory, video) + 1 external (go-sdl2) + 5 stdlib |
+
+### What Is Next
+
+The walkthrough series is complete for the current codebase. The natural
+next areas of development are:
+
+- **Lo-res graphics (GR)** -- reinterpret the `$0400`-`$07FF` text page
+  bytes as 40x48 color blocks when the `TEXT` softswitch is off and `HIRES`
+  is off.
+- **Hi-res graphics (HGR)** -- a new renderer that reads the `$2000`-`$3FFF`
+  (8,192-16,383) bitmap area and maps each byte to seven horizontal pixels
+  using the Apple II's peculiar color encoding.
+- **Audio output** -- sample the speaker-toggle softswitch at `$C030`
+  (49,200) and convert state changes into a PCM waveform sent to SDL's audio
+  subsystem.
+- **Disk II** -- implement slot 6 I/O to load software from `.dsk` or `.woz`
+  disk images, enabling the emulator to run the Apple II software library.
+- **Bank switching / language card** -- allow the ROM region `$D000`-`$FFFF`
+  (53,248-65,535) to be remapped to writable RAM, enabling Applesoft BASIC
+  to be replaced with Integer BASIC and enabling 64 KB of accessible RAM.
