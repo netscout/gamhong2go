@@ -13,6 +13,7 @@ import (
 	"github.com/apple2emu/cpu"
 	appleio "github.com/apple2emu/io"
 	"github.com/apple2emu/memory"
+	"github.com/apple2emu/speaker"
 	"github.com/apple2emu/video"
 )
 
@@ -30,7 +31,19 @@ const (
 
 func main() {
 	romPath := flag.String("rom", "roms/Apple2_Plus.rom", "Path to Apple II ROM image (12 KB or 16 KB)")
+	volume := flag.Float64("volume", 0.25, "Speaker volume in [0.0, 1.0] (0 = mute)")
+	sampleRate := flag.Int("samplerate", 44100, "Audio sample rate in Hz")
 	flag.Parse()
+
+	if *volume < 0 || *volume > 1 {
+		fmt.Fprintf(os.Stderr, "warning: -volume %.3f out of [0,1], clamping\n", *volume)
+		if *volume < 0 {
+			*volume = 0
+		}
+		if *volume > 1 {
+			*volume = 1
+		}
+	}
 
 	// --- Load ROM -----------------------------------------------------------
 	rom, err := loadROM(*romPath)
@@ -51,7 +64,7 @@ func main() {
 	b.Map(0xC000, 0xC0FF, sw)
 	b.Map(rom.Base, rom.End(), rom)
 
-	fmt.Printf("Apple II Emulator — Iteration 3\n")
+	fmt.Printf("Apple II Emulator — Iteration 6\n")
 	fmt.Printf("ROM: %s (%d bytes at $%04X–$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
 
 	// --- Init CPU -----------------------------------------------------------
@@ -63,7 +76,7 @@ func main() {
 	vid := video.NewVideo(ram.Data[:])
 
 	// --- Init SDL2 ----------------------------------------------------------
-	if err := sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS)); err != nil {
+	if err := sdl.Init(uint32(sdl.INIT_VIDEO) | uint32(sdl.INIT_EVENTS) | uint32(sdl.INIT_AUDIO)); err != nil {
 		fmt.Fprintf(os.Stderr, "SDL init failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -103,6 +116,20 @@ func main() {
 	}
 	defer texture.Destroy()
 
+	var frameCycle uint64
+	spk, spkErr := speaker.New(speaker.Config{
+		SampleRate: *sampleRate,
+		CPUClock:   cpuClock,
+		Volume:     float32(*volume),
+	}, &frameCycle)
+	if spkErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", spkErr)
+	}
+	defer spk.Close() // LAST defer -> FIRST to run
+
+	// Map speaker AFTER SoftSwitches so it wins $C030-$C03F.
+	b.Map(0xC030, 0xC03F, speaker.NewDevice(spk))
+
 	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
 
 	// --- Main loop ----------------------------------------------------------
@@ -129,20 +156,37 @@ func main() {
 						running = false
 					}
 					// Ctrl+R to reset
+					// reset does not interfere with audio: per-frame buffers drain naturally
 					if e.Keysym.Sym == sdl.K_r && e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
 						c.Reset()
 					}
+				}
+
+			case *sdl.WindowEvent:
+				switch e.Event {
+				case sdl.WINDOWEVENT_FOCUS_LOST, sdl.WINDOWEVENT_HIDDEN, sdl.WINDOWEVENT_MINIMIZED:
+					spk.PauseFromHost(true)
+				case sdl.WINDOWEVENT_FOCUS_GAINED, sdl.WINDOWEVENT_SHOWN, sdl.WINDOWEVENT_RESTORED:
+					spk.PauseFromHost(false)
 				}
 			}
 		}
 
 		// 2. Run CPU for one frame's worth of cycles
-		for cycles := 0; cycles < cyclesPerFrame; {
-			cycles += c.Step()
+		// Reset frame-relative cycle counter at the start of each frame.
+		frameCycle = 0
+		for frameCycle < uint64(cyclesPerFrame) {
+			// frameCycle holds the CPU's cycle offset at the START of the next
+			// instruction. Speaker.Toggle reads *frameCycle when $C030 is hit
+			// during c.Step(), so toggles are stamped at the instruction's start
+			// cycle. We increment AFTER Step() completes.
+			consumed := uint64(c.Step())
+			frameCycle += consumed
 		}
+		spk.EndFrame(frameCycle)
 
 		// 3. Render the screen
-		vid.RenderText()
+		vid.Render(sw.TextMode, sw.MixedMode, sw.HiRes, sw.Page2)
 
 		// 4. Upload pixel buffer to SDL texture and present
 		texture.Update(nil, unsafe.Pointer(&vid.Pixels[0]), int(video.ScreenW)*4)

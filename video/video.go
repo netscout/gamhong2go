@@ -32,17 +32,35 @@ func NewVideo(ram []uint8) *Video {
 	}
 }
 
-// RenderText renders the 40×24 text screen (page 1 at $0400–$07FF)
-// into the Pixels buffer.
-func (v *Video) RenderText() {
-	// Update flash state: toggle every 16 frames (~1.875 Hz at 60 fps)
+// Render dispatches to the correct rendering mode based on soft switch state.
+func (v *Video) Render(textMode, mixedMode, hiRes, page2 bool) {
+	// Update flash counter every frame
 	v.flashCounter++
 	if v.flashCounter >= 16 {
 		v.flashCounter = 0
 		v.FlashState = !v.FlashState
 	}
 
-	for row := 0; row < TextRows; row++ {
+	switch {
+	case textMode:
+		v.RenderText()
+	case hiRes:
+		v.RenderHiRes(page2, mixedMode)
+	default:
+		v.RenderLoRes(mixedMode)
+	}
+}
+
+// RenderText renders the 40×24 text screen (page 1 at $0400–$07FF)
+// into the Pixels buffer.
+func (v *Video) RenderText() {
+	v.renderTextRows(0, TextRows)
+}
+
+// renderTextRows renders a range of text rows [startRow, endRow).
+// Used by both full text mode and mixed-mode graphics.
+func (v *Video) renderTextRows(startRow, endRow int) {
+	for row := startRow; row < endRow; row++ {
 		baseAddr := textLineAddr(row)
 
 		for col := 0; col < TextCols; col++ {
