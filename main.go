@@ -11,6 +11,7 @@ import (
 
 	"github.com/apple2emu/bus"
 	"github.com/apple2emu/cpu"
+	"github.com/apple2emu/disk"
 	appleio "github.com/apple2emu/io"
 	"github.com/apple2emu/memory"
 	"github.com/apple2emu/speaker"
@@ -33,6 +34,11 @@ func main() {
 	romPath := flag.String("rom", "roms/Apple2_Plus.rom", "Path to Apple II ROM image (12 KB or 16 KB)")
 	volume := flag.Float64("volume", 0.25, "Speaker volume in [0.0, 1.0] (0 = mute)")
 	sampleRate := flag.Int("samplerate", 44100, "Audio sample rate in Hz")
+	disk1 := flag.String("disk1", "", "Path to .dsk/.do/.po image for drive 1")
+	disk2 := flag.String("disk2", "", "Path to .dsk/.do/.po image for drive 2 (optional)")
+	order := flag.String("order", "", "Sector order override: dos | prodos (default: infer from extension)")
+	diskTrace := flag.Bool("disktrace", false, "Log disk activity to stderr (rate-limited to 200 nibble reads)")
+	diskTraceN := flag.Int("disktracen", 200, "Max nibble-read lines to emit when -disktrace is set (0 = unlimited)")
 	flag.Parse()
 
 	if *volume < 0 || *volume > 1 {
@@ -64,7 +70,7 @@ func main() {
 	b.Map(0xC000, 0xC0FF, sw)
 	b.Map(rom.Base, rom.End(), rom)
 
-	fmt.Printf("Apple II Emulator — Iteration 6\n")
+	fmt.Printf("Apple II Emulator — Iteration 7\n")
 	fmt.Printf("ROM: %s (%d bytes at $%04X–$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
 
 	// --- Init CPU -----------------------------------------------------------
@@ -130,6 +136,45 @@ func main() {
 	// Map speaker AFTER SoftSwitches so it wins $C030-$C03F.
 	b.Map(0xC030, 0xC03F, speaker.NewDevice(spk))
 
+	// --- Disk II (slot 6) ---------------------------------------------------
+	// diskCycle is a monotonically-increasing CPU cycle counter for the disk
+	// controller.  Unlike frameCycle (which resets to 0 at the start of each
+	// video frame), diskCycle never wraps, so the controller's lastCycle
+	// subtraction never produces a spurious uint64 underflow that would cause
+	// nibblePos to jump wildly across the track.
+	var diskCycle uint64
+	dc := disk.NewController(&diskCycle)
+	if *diskTrace {
+		dc.SetTracer(disk.NewStderrTracer(os.Stderr, *diskTraceN))
+	}
+	if *disk1 != "" {
+		if err := dc.Mount(0, *disk1, *order); err != nil {
+			fmt.Fprintf(os.Stderr, "disk1: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Disk 1: %s\n", *disk1)
+	}
+	if *disk2 != "" {
+		if err := dc.Mount(1, *disk2, *order); err != nil {
+			fmt.Fprintf(os.Stderr, "disk2: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Disk 2: %s\n", *disk2)
+	}
+	defer dc.Close() // flushes dirty tracks
+
+	// Softswitch window for slot 6: $C0E0-$C0EF (overlays SoftSwitches; last-wins).
+	b.Map(0xC0E0, 0xC0EF, disk.NewSwitches(dc))
+
+	// Boot PROM for slot 6: $C600-$C6FF.
+	prom, err := memory.LoadROM("roms/DISK2.rom", 0xC600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "disk PROM: %v\n", err)
+		os.Exit(1)
+	}
+	b.Map(prom.Base, prom.End(), prom)
+	fmt.Printf("Disk II PROM: roms/DISK2.rom (%d bytes at $%04X–$%04X)\n", prom.Size(), prom.Base, prom.End())
+
 	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
 
 	// --- Main loop ----------------------------------------------------------
@@ -182,6 +227,7 @@ func main() {
 			// cycle. We increment AFTER Step() completes.
 			consumed := uint64(c.Step())
 			frameCycle += consumed
+			diskCycle += consumed
 		}
 		spk.EndFrame(frameCycle)
 

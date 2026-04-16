@@ -1,0 +1,252 @@
+Apple II Emulator — Iteration 7
+ROM: roms/Apple2_Plus.rom (12288 bytes at $D000–$FFFF)
+Reset vector: $FA62
+disk: drive 1: disks/DOS_3_3.dsk (order=0, wp=false)
+Disk 1: disks/DOS_3_3.dsk
+Disk II PROM: roms/DISK2.rom (256 bytes at $C600–$C6FF)
+Running... (Esc to quit, Ctrl+R to reset)
+speaker: audio underrun detected (will not warn again)
+DISK MODE cycle=137838     drv=1 MOTORON
+DISK PHS  cycle=137844     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=137859     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=157534     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=157549     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=177224     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=177239     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=196914     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=196929     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=216604     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=216619     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=236294     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=236309     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=255984     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=255999     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=275674     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=275689     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=295364     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=295379     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=315054     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=315069     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=334744     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=334759     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=354434     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=354449     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=374124     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=374139     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=393814     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=393829     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=413504     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=413519     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=433194     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=433209     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=452884     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=452899     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=472574     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=472589     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=492264     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=492279     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=511954     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=511969     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=531644     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=531659     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=551334     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=551349     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=571024     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=571039     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=590714     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=590729     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=610404     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=610419     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=630094     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=630109     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=649784     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=649799     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=669474     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=669489     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=689164     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=689179     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=708854     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=708869     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=728544     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=728559     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=748234     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=748249     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=767924     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=767939     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=787614     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=787629     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=807304     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=807319     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=826994     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=827009     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=846684     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=846699     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=866374     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=866389     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=886064     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=886079     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=905754     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=905769     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=925444     drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=925459     drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=945134     drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=945149     drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=964824     drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=964839     drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=984514     drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=984529     drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1004204    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1004219    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1023894    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1023909    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1043584    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1043599    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1063274    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1063289    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1082964    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1082979    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1102654    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1102669    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1122344    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1122359    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1142034    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1142049    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1161724    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1161739    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1181414    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1181429    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1201104    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1201119    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1220794    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1220809    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1240484    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1240499    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1260174    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1260189    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1279864    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1279879    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1299554    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1299569    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1319244    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1319259    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1338934    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1338949    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1358624    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1358639    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1378314    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1378329    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1398004    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1398019    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1417694    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1417709    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1437384    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1437399    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1457074    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1457089    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1476764    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1476779    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1496454    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1496469    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1516144    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1516159    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1535834    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1535849    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1555524    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1555539    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1575214    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1575229    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1594904    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1594919    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1614594    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1614609    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1634284    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1634299    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK PHS  cycle=1653974    drv=1 phase=0 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1653989    drv=1 phase=3 ON   ht  0-> 0  phases=1000
+DISK PHS  cycle=1673664    drv=1 phase=3 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1673679    drv=1 phase=2 ON   ht  0-> 0  phases=0100
+DISK PHS  cycle=1693354    drv=1 phase=2 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1693369    drv=1 phase=1 ON   ht  0-> 0  phases=0010
+DISK PHS  cycle=1713044    drv=1 phase=1 OFF  ht  0-> 0  phases=0000
+DISK PHS  cycle=1713059    drv=1 phase=0 ON   ht  0-> 0  phases=0001
+DISK NIB  cycle=1732752    drv=1 ht= 0 pos=3076 val=E7
+DISK NIB  cycle=1732770    drv=1 ht= 0 pos=3077 val=B6
+DISK NIB  cycle=1732802    drv=1 ht= 0 pos=3078 val=F3
+DISK NIB  cycle=1732834    drv=1 ht= 0 pos=3079 val=DD
+DISK NIB  cycle=1732866    drv=1 ht= 0 pos=3080 val=B6
+DISK NIB  cycle=1732898    drv=1 ht= 0 pos=3081 val=F3
+DISK NIB  cycle=1732930    drv=1 ht= 0 pos=3082 val=9E
+DISK NIB  cycle=1732962    drv=1 ht= 0 pos=3083 val=DC
+DISK NIB  cycle=1732994    drv=1 ht= 0 pos=3084 val=D6
+DISK NIB  cycle=1733026    drv=1 ht= 0 pos=3085 val=DD
+DISK NIB  cycle=1733058    drv=1 ht= 0 pos=3086 val=B4
+DISK NIB  cycle=1733090    drv=1 ht= 0 pos=3087 val=F5
+DISK NIB  cycle=1733122    drv=1 ht= 0 pos=3088 val=EC
+DISK NIB  cycle=1733154    drv=1 ht= 0 pos=3089 val=DD
+DISK NIB  cycle=1733186    drv=1 ht= 0 pos=3090 val=9E
+DISK NIB  cycle=1733218    drv=1 ht= 0 pos=3091 val=E5
+DISK NIB  cycle=1733250    drv=1 ht= 0 pos=3092 val=E7
+DISK NIB  cycle=1733282    drv=1 ht= 0 pos=3093 val=F9
+DISK NIB  cycle=1733314    drv=1 ht= 0 pos=3094 val=96
+DISK NIB  cycle=1733346    drv=1 ht= 0 pos=3095 val=AB
+DISK NIB  cycle=1733378    drv=1 ht= 0 pos=3096 val=A7
+DISK NIB  cycle=1733410    drv=1 ht= 0 pos=3097 val=F5
+DISK NIB  cycle=1733442    drv=1 ht= 0 pos=3098 val=EB
+DISK NIB  cycle=1733474    drv=1 ht= 0 pos=3099 val=BD
+DISK NIB  cycle=1733506    drv=1 ht= 0 pos=3100 val=F5
+DISK NIB  cycle=1733538    drv=1 ht= 0 pos=3101 val=FE
+DISK NIB  cycle=1733570    drv=1 ht= 0 pos=3102 val=B3
+DISK NIB  cycle=1733602    drv=1 ht= 0 pos=3103 val=EE
+DISK NIB  cycle=1733634    drv=1 ht= 0 pos=3104 val=FE
+DISK NIB  cycle=1733666    drv=1 ht= 0 pos=3105 val=AD
+DISK NIB  cycle=1733698    drv=1 ht= 0 pos=3106 val=F4
+DISK NIB  cycle=1733730    drv=1 ht= 0 pos=3107 val=F9
+DISK NIB  cycle=1733762    drv=1 ht= 0 pos=3108 val=9B
+DISK NIB  cycle=1733794    drv=1 ht= 0 pos=3109 val=EC
+DISK NIB  cycle=1733826    drv=1 ht= 0 pos=3110 val=BF
+DISK NIB  cycle=1733858    drv=1 ht= 0 pos=3111 val=CD
+DISK NIB  cycle=1733890    drv=1 ht= 0 pos=3112 val=BB
+DISK NIB  cycle=1733922    drv=1 ht= 0 pos=3113 val=A7
+DISK NIB  cycle=1733954    drv=1 ht= 0 pos=3114 val=B3
+DISK NIB  cycle=1733986    drv=1 ht= 0 pos=3115 val=DA
+DISK NIB  cycle=1734018    drv=1 ht= 0 pos=3116 val=E9
+DISK NIB  cycle=1734050    drv=1 ht= 0 pos=3117 val=AC
+DISK NIB  cycle=1734082    drv=1 ht= 0 pos=3118 val=AE
+DISK NIB  cycle=1734114    drv=1 ht= 0 pos=3119 val=CF
+DISK NIB  cycle=1734146    drv=1 ht= 0 pos=3120 val=B6
+DISK NIB  cycle=1734178    drv=1 ht= 0 pos=3121 val=9D
+DISK NIB  cycle=1734210    drv=1 ht= 0 pos=3122 val=BB
+DISK NIB  cycle=1734242    drv=1 ht= 0 pos=3123 val=F2
+DISK NIB  cycle=1734274    drv=1 ht= 0 pos=3124 val=9D
+DISK NIB  cycle=1734306    drv=1 ht= 0 pos=3125 val=D9
+DISK ADDR cycle=1737282    drv=1 ht= 0 pos=3218 vol=254 trk=0 sec=8
+DISK ADDR cycle=1749957    drv=1 ht= 0 pos=3614 vol=254 trk=0 sec=9
+DISK ADDR cycle=1762625    drv=1 ht= 0 pos=4010 vol=254 trk=0 sec=10
+DISK ADDR cycle=1775300    drv=1 ht= 0 pos=4406 vol=254 trk=0 sec=11
+DISK ADDR cycle=1787968    drv=1 ht= 0 pos=4802 vol=254 trk=0 sec=12
+DISK ADDR cycle=1800643    drv=1 ht= 0 pos=5198 vol=254 trk=0 sec=13
+DISK ADDR cycle=1813318    drv=1 ht= 0 pos=5594 vol=254 trk=0 sec=14
+DISK ADDR cycle=1825986    drv=1 ht= 0 pos=5990 vol=254 trk=0 sec=15
+DISK ADDR cycle=1840197    drv=1 ht= 0 pos=  50 vol=254 trk=0 sec=0
+DISK ADDR cycle=1865539    drv=1 ht= 0 pos= 842 vol=254 trk=0 sec=2
+DISK ADDR cycle=1878214    drv=1 ht= 0 pos=1238 vol=254 trk=0 sec=3
+DISK ADDR cycle=1890882    drv=1 ht= 0 pos=1634 vol=254 trk=0 sec=4
+DISK ADDR cycle=1903557    drv=1 ht= 0 pos=2030 vol=254 trk=0 sec=5
+DISK ADDR cycle=1916225    drv=1 ht= 0 pos=2426 vol=254 trk=0 sec=6
+DISK ADDR cycle=1928900    drv=1 ht= 0 pos=2822 vol=254 trk=0 sec=7
+DISK ADDR cycle=1941568    drv=1 ht= 0 pos=3218 vol=254 trk=0 sec=8
+DISK ADDR cycle=1954243    drv=1 ht= 0 pos=3614 vol=254 trk=0 sec=9
+DISK ADDR cycle=1966918    drv=1 ht= 0 pos=4010 vol=254 trk=0 sec=10
+DISK ADDR cycle=1979586    drv=1 ht= 0 pos=4406 vol=254 trk=0 sec=11
+DISK ADDR cycle=1992261    drv=1 ht= 0 pos=4802 vol=254 trk=0 sec=12
+DISK ADDR cycle=2017601    drv=1 ht= 0 pos=5594 vol=254 trk=0 sec=14
+DISK ADDR cycle=2044484    drv=1 ht= 0 pos=  50 vol=254 trk=0 sec=0
+DISK ADDR cycle=2057152    drv=1 ht= 0 pos= 446 vol=254 trk=0 sec=1
+DISK ADDR cycle=2082499    drv=1 ht= 0 pos=1238 vol=254 trk=0 sec=3
+DISK ADDR cycle=2107846    drv=1 ht= 0 pos=2030 vol=254 trk=0 sec=5
+DISK ADDR cycle=2133186    drv=1 ht= 0 pos=2822 vol=254 trk=0 sec=7
+DISK ADDR cycle=2158533    drv=1 ht= 0 pos=3614 vol=254 trk=0 sec=9
+DISK ADDR cycle=2183873    drv=1 ht= 0 pos=4406 vol=254 trk=0 sec=11
+DISK ADDR cycle=2209220    drv=1 ht= 0 pos=5198 vol=254 trk=0 sec=13
+DISK ADDR cycle=2234560    drv=1 ht= 0 pos=5990 vol=254 trk=0 sec=15
+DISK ADDR cycle=2248771    drv=1 ht= 0 pos=  50 vol=254 trk=0 sec=0

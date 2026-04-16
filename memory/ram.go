@@ -6,7 +6,7 @@ type RAM struct {
 	Data [0x10000]uint8 // Full 64 KB backing store for simplicity
 }
 
-// NewRAM returns an initialised RAM (all zeroes).
+// NewRAM returns zero-initialised RAM.
 func NewRAM() *RAM {
 	return &RAM{}
 }
