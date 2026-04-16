@@ -3,7 +3,7 @@ package disk
 
 import "fmt"
 
-// SectorOrder selects the physical-to-logical sector mapping used when
+// SectorOrder selects the logical-to-physical sector mapping used when
 // encoding/decoding a disk image.
 type SectorOrder int
 
@@ -13,10 +13,11 @@ const (
 )
 
 // dosInterleave maps logical sector index -> physical sector on a DOS 3.3 track.
-var dosInterleave = [16]int{0, 7, 14, 6, 13, 5, 12, 4, 11, 3, 10, 2, 9, 1, 8, 15}
+// This is the RWTS sector translation table from the DOS 3.3 source.
+var dosInterleave = [16]int{0, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 15}
 
 // prodosInterleave maps logical sector index -> physical sector on a ProDOS track.
-var prodosInterleave = [16]int{0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}
+var prodosInterleave = [16]int{0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15}
 
 // gcr62 is the 6-and-2 write-translate table. Index is the 6-bit value (0..63);
 // value is the on-disk nibble byte (bit 7 always set).

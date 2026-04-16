@@ -72,6 +72,41 @@ func TestEncodeDecodeRoundTripDOS(t *testing.T) {
 	}
 }
 
+func TestDOSInterleaveDirection(t *testing.T) {
+	var sectors [sectorsPerTrack][bytesPerSector]uint8
+	for i := range sectors {
+		sectors[i][0] = uint8(i)
+	}
+	nibs := EncodeTrack(sectors, 254, 0, OrderDOS)
+
+	// Walk the nibble stream and extract (physSec, firstByte) pairs
+	// from the address and data fields.
+	type found struct{ phys, tag uint8 }
+	var hits []found
+	for i := 0; i < len(nibs)-400; i++ {
+		if nibs[i] != 0xD5 || nibs[i+1] != 0xAA || nibs[i+2] != 0x96 {
+			continue
+		}
+		physSec := (nibs[i+7] & 0x55) | ((nibs[i+8] & 0x55) << 1)
+		// Find the data prologue after this address field.
+		for j := i + 14; j < i+60 && j < len(nibs)-350; j++ {
+			if nibs[j] == 0xD5 && nibs[j+1] == 0xAA && nibs[j+2] == 0xAD {
+				hits = append(hits, found{physSec, sectors[physSec][0]})
+				break
+			}
+		}
+	}
+
+	// DOS 3.3 RWTS: logical 1 -> physical 13, logical 4 -> physical 7.
+	// The sector tagged with logical index N should appear at physical dosInterleave[N].
+	if dosInterleave[1] != 13 {
+		t.Errorf("dosInterleave[1] = %d, want 13 (RWTS sector translation)", dosInterleave[1])
+	}
+	if dosInterleave[4] != 7 {
+		t.Errorf("dosInterleave[4] = %d, want 7 (RWTS sector translation)", dosInterleave[4])
+	}
+}
+
 func TestEncodeDecodeRoundTripProDOS(t *testing.T) {
 	original := buildTestSectors(0x55)
 	nibs := EncodeTrack(original, 254, 10, OrderProDOS)

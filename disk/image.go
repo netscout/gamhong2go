@@ -21,8 +21,7 @@ type diskImage struct {
 	path      string
 	order     SectorOrder
 	writeProt bool
-	// data[track][physicalSector][byte]  in the on-disk physical sector order
-	// (before interleave reversal — we store them in logical order for simplicity)
+	// data[track][logicalSector][byte] in file (logical) sector order
 	data [tracksPerDisk][sectorsPerTrack][bytesPerSector]uint8
 }
 
