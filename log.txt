@@ -1,7 +1,0 @@
-❯ go run .
-Apple II Emulator — Iteration 7
-ROM: roms/Apple2_Plus.rom (12288 bytes at $D000–$FFFF)
-Reset vector: $FA62
-Disk II PROM: roms/DISK2.rom (256 bytes at $C600–$C6FF)
-Running... (Esc to quit, Ctrl+R to reset)
-speaker: audio underrun detected (will not warn again)
