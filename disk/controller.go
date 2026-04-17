@@ -9,9 +9,18 @@ package disk
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 const cyclesPerNibble uint64 = 32
+
+// numDrives is the number of drive slots a Disk II controller card has.
+// Used for bounds-checking public drive-index APIs.
+const numDrives = 2
+
+// nowFn is an injection seam so tests can advance "wall clock" without
+// real time.Sleep calls. Production code leaves this pointing at time.Now.
+var nowFn = time.Now
 
 // Controller emulates the Disk II controller card.
 type Controller struct {
@@ -80,6 +89,49 @@ func (c *Controller) flushAll() {
 			fmt.Fprintf(os.Stderr, "disk: close: flush drive %d: %v\n", di+1, err)
 		}
 	}
+}
+
+// recentActivityWindow is the wall-clock lookback window for activity
+// indicators. 500 ms is well above the perceptual threshold for a single
+// blink (~100 ms) and short enough that a cleanly-finished read fades
+// quickly. Wall-clock so the indicator stays correct under turbo (where
+// emulated cycles pass much faster than wall-clock cycles).
+const recentActivityWindow = 500 * time.Millisecond
+
+// HadRecentRead returns true if drive driveIdx (0 or 1) has read a nibble
+// within the last 500 ms of wall-clock time. Safe to call from the main
+// goroutine; no locking required (single-goroutine emulator).
+func (c *Controller) HadRecentRead(driveIdx int) bool {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return false
+	}
+	last := c.drives[driveIdx].lastReadAt
+	if last.IsZero() {
+		return false
+	}
+	return nowFn().Sub(last) < recentActivityWindow
+}
+
+// HadRecentWrite returns true if drive driveIdx (0 or 1) has written a
+// nibble within the last 500 ms of wall-clock time.
+func (c *Controller) HadRecentWrite(driveIdx int) bool {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return false
+	}
+	last := c.drives[driveIdx].lastWriteAt
+	if last.IsZero() {
+		return false
+	}
+	return nowFn().Sub(last) < recentActivityWindow
+}
+
+// HasDisk returns true if the given drive slot has a mounted disk. Used
+// by the window-title indicator to decide whether to show a slot at all.
+func (c *Controller) HasDisk(driveIdx int) bool {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return false
+	}
+	return c.drives[driveIdx].image != nil
 }
 
 // Strobe handles a softswitch access at addr in [$C0E0..$C0EF].
@@ -196,6 +248,7 @@ func (c *Controller) q6LAccess() uint8 {
 			}
 			now := *c.cyclePtr
 			c.lastCycle = now
+			d.lastWriteAt = nowFn()
 		}
 		return c.latch
 	}
@@ -245,6 +298,7 @@ func (c *Controller) readDataLatch(d *drive) uint8 {
 	d.nibblePos = (d.nibblePos + int(steps)) % nLen
 	c.latch = nibs[d.nibblePos]
 	c.lastCycle = now - rem // preserve sub-nibble phase
+	d.lastReadAt = nowFn()
 
 	// Trace: emit nibble read event (rate-limited by the Tracer implementation).
 	if c.tracer != nil {

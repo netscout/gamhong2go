@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -19,10 +20,19 @@ import (
 )
 
 const (
-	// Apple II runs at 1.023 MHz, display refreshes at ~60 Hz.
+	// Apple II runs at 1.023 MHz; display refreshes at ~60 Hz.
+	//
+	// cyclesPerFrame = cpuClock / targetFPS = 17050 is deliberately 20
+	// cycles larger than the real NTSC video frame (262×65 = 17030, see
+	// io/softswitches.go). Speaker math keys samplesPerFrame to
+	// cpuClock/sampleRate = 735 exactly at 44.1 kHz; shrinking the CPU
+	// slice to 17030 would drain SDL's queue ~58 samples/sec. Games
+	// care about CPU clock accuracy (pitch, disk nibble timing) far
+	// more than host-frame wall-clock length; the resulting ~4.2 s/hour
+	// CPU-vs-video drift is imperceptible.
 	cpuClock       = 1023000
 	targetFPS      = 60
-	cyclesPerFrame = cpuClock / targetFPS // ~17050
+	cyclesPerFrame = cpuClock / targetFPS // 17050 — CPU slice per host frame; also drives speaker math.
 
 	// Window size: 3× native resolution for visibility.
 	windowScale = 3
@@ -62,8 +72,12 @@ func main() {
 	}
 
 	// --- Wire the bus -------------------------------------------------------
+	// diskCycle must be declared before sw so its address can be passed to
+	// NewSoftSwitches (paddle timers share this monotonic counter).
+	var diskCycle uint64
+
 	ram := memory.NewRAM()
-	sw := appleio.NewSoftSwitches()
+	sw := appleio.NewSoftSwitches(&diskCycle)
 	b := bus.NewBus()
 
 	b.Map(0x0000, 0xBFFF, ram)
@@ -100,8 +114,11 @@ func main() {
 	}
 	defer window.Destroy()
 
+	// No RENDERER_PRESENTVSYNC: we use time.Sleep-based pacing in the main loop
+	// as the single frame cap. VSync + manual cap cause speed drift on
+	// non-60 Hz displays (e.g. 120 Hz ProMotion, 59.94 Hz NTSC).
 	renderer, err := sdl.CreateRenderer(window, -1,
-		sdl.RENDERER_ACCELERATED|sdl.RENDERER_PRESENTVSYNC)
+		sdl.RENDERER_ACCELERATED)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Create renderer failed: %v\n", err)
 		os.Exit(1)
@@ -142,7 +159,8 @@ func main() {
 	// video frame), diskCycle never wraps, so the controller's lastCycle
 	// subtraction never produces a spurious uint64 underflow that would cause
 	// nibblePos to jump wildly across the track.
-	var diskCycle uint64
+	// Note: diskCycle is declared above (before sw) so both the disk controller
+	// and paddle timers share the same monotonic pointer.
 	dc := disk.NewController(&diskCycle)
 	if *diskTrace {
 		dc.SetTracer(disk.NewStderrTracer(os.Stderr, *diskTraceN))
@@ -196,30 +214,67 @@ func main() {
 				running = false
 
 			case *sdl.KeyboardEvent:
-				if e.Type == sdl.KEYDOWN {
-					if key := sdlKeyToApple(e); key != 0 {
-						sw.PressKey(key)
-					}
+				switch e.Type {
+				case sdl.KEYDOWN:
 					// Escape to quit
 					if e.Keysym.Sym == sdl.K_ESCAPE {
 						running = false
+						break
 					}
-					// Ctrl+R to reset
-					// reset does not interfere with audio: per-frame buffers drain naturally
+					// Ctrl+R to reset (no audio interference: buffers drain naturally)
 					if e.Keysym.Sym == sdl.K_r && e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
 						c.Reset()
+						break
 					}
+					// F12 turbo mode (hold to activate)
+					if handleTurboKeyDown(e.Keysym.Sym) {
+						break
+					}
+					// Arrow keys drive virtual paddle (no character passthrough)
+					if handleArrowKeyDown(e.Keysym.Sym, sw) {
+						break
+					}
+					// Joystick buttons (left-alt / right-alt)
+					if handleButtonKeyDown(e.Keysym.Sym, sw) {
+						break
+					}
+					// Character keystrokes
+					if key := sdlKeyToApple(e); key != 0 {
+						sw.PressKey(key)
+					}
+
+				case sdl.KEYUP:
+					handleTurboKeyUp(e.Keysym.Sym)
+					handleArrowKeyUp(e.Keysym.Sym, sw)
+					handleButtonKeyUp(e.Keysym.Sym, sw)
 				}
 
 			case *sdl.WindowEvent:
 				switch e.Event {
 				case sdl.WINDOWEVENT_FOCUS_LOST, sdl.WINDOWEVENT_HIDDEN, sdl.WINDOWEVENT_MINIMIZED:
 					spk.PauseFromHost(true)
+					// Clear any held buttons/paddles to avoid stuck input after
+					// alt-tab or window minimize.
+					sw.ReleaseButton(0)
+					sw.ReleaseButton(1)
+					sw.ReleaseButton(2)
+					sw.SetPaddle(0, 128)
+					sw.SetPaddle(1, 128)
+					leftHeld, rightHeld, upHeld, downHeld = false, false, false, false
+					turboMode = false // never leave turbo armed after window loses focus
 				case sdl.WINDOWEVENT_FOCUS_GAINED, sdl.WINDOWEVENT_SHOWN, sdl.WINDOWEVENT_RESTORED:
 					spk.PauseFromHost(false)
 				}
 			}
 		}
+
+		// 1b. Turbo edge detect: if turbo just released, drop the queued
+		// fast-speed audio samples BEFORE this frame's EndFrame push, so
+		// the new real-speed audio frame is queued cleanly.
+		if prevTurbo && !turboMode {
+			spk.ClearAudioQueue()
+		}
+		prevTurbo = turboMode
 
 		// 2. Run CPU for one frame's worth of cycles
 		// Reset frame-relative cycle counter at the start of each frame.
@@ -235,7 +290,7 @@ func main() {
 		}
 		spk.EndFrame(frameCycle)
 
-		// 3. Render the screen
+		// 3. Render the screen — every frame.
 		vid.Render(sw.TextMode, sw.MixedMode, sw.HiRes, sw.Page2)
 
 		// 4. Upload pixel buffer to SDL texture and present
@@ -244,19 +299,35 @@ func main() {
 		renderer.Copy(texture, nil, nil)
 		renderer.Present()
 
-		// 5. FPS counter in title bar
+		// 5. Title-bar update (FPS / TURBO + disk activity), once per second.
 		frameCount++
 		if time.Since(fpsTimer) >= time.Second {
-			window.SetTitle(fmt.Sprintf("Apple II Emulator — %d fps", frameCount))
+			window.SetTitle(buildTitle(frameCount, dc, turboMode))
 			frameCount = 0
 			fpsTimer = time.Now()
 		}
 
-		// If vsync isn't working, manually cap to 60 fps
-		elapsed := time.Since(frameStart)
-		target := time.Second / targetFPS
-		if elapsed < target {
-			sdl.Delay(uint32((target - elapsed).Milliseconds()))
+		// 6. Frame cap — bypassed in turbo.
+		// Frame cap — sleep until target frame time. Uses time.Sleep for sub-ms
+		// precision so we don't truncate ~900µs/frame.
+		//
+		// Why this matters for audio: under-sleeping makes our loop iterate faster
+		// than 60 Hz, which over-fills the SDL audio queue. Speaker back-pressures
+		// (drops frames at >4*bytesPerFrame queued, see speaker.go:191), eventually
+		// underrunning and emitting the warning at speaker.go:184. Sub-ms sleep
+		// keeps the queue near 1 frame deep.
+		//
+		// Floor at 100µs avoids hot-spin when the remaining budget is near-zero
+		// (Go's time.Sleep guarantees AT LEAST the duration; on darwin, very
+		// small sleeps still take ~50µs of overhead, but 0-budget skips here
+		// would be a tight retry loop).
+		if !turboMode {
+			elapsed := time.Since(frameStart)
+			target := time.Second / targetFPS
+			remaining := target - elapsed
+			if remaining > 100*time.Microsecond {
+				time.Sleep(remaining)
+			}
 		}
 	}
 }
@@ -282,17 +353,11 @@ func sdlKeyToApple(e *sdl.KeyboardEvent) uint8 {
 		return 0x08
 	case sdl.K_DELETE:
 		return 0x7F
-	case sdl.K_LEFT:
-		return 0x08
-	case sdl.K_RIGHT:
-		return 0x15
-	case sdl.K_UP:
-		return 0x0B
-	case sdl.K_DOWN:
-		return 0x0A
 	case sdl.K_TAB:
 		return 0x09
 	}
+	// Note: arrow keys (K_LEFT, K_RIGHT, K_UP, K_DOWN) are intentionally NOT
+	// mapped here — they drive the virtual paddle via handleArrowKey* instead.
 
 	// Printable ASCII characters
 	if int32(sym) >= 32 && int32(sym) <= 126 {
@@ -357,6 +422,158 @@ func sdlKeyToApple(e *sdl.KeyboardEvent) uint8 {
 	}
 
 	return 0
+}
+
+// Arrow-key held state for virtual paddle axis tracking.
+// Tracked so releasing one key while the opposite is still held restores the
+// correct direction rather than snapping to center prematurely.
+var (
+	leftHeld, rightHeld bool
+	upHeld, downHeld    bool
+)
+
+// turboMode is toggled by F12. While true, the frame cap is bypassed so
+// the CPU emulation speed scales with host capacity. Render still happens
+// every frame; frame-skip is a future tuning knob only useful if profiling
+// shows render dominates host cost.
+var turboMode bool
+var prevTurbo bool
+
+// handleArrowKeyDown maps arrow key presses to virtual paddle positions.
+// Returns true if the key was consumed (caller should not pass to sdlKeyToApple).
+func handleArrowKeyDown(sym sdl.Keycode, sw *appleio.SoftSwitches) bool {
+	switch sym {
+	case sdl.K_LEFT:
+		leftHeld = true
+		sw.SetPaddle(0, 0)
+		return true
+	case sdl.K_RIGHT:
+		rightHeld = true
+		sw.SetPaddle(0, 255)
+		return true
+	case sdl.K_UP:
+		upHeld = true
+		sw.SetPaddle(1, 0)
+		return true
+	case sdl.K_DOWN:
+		downHeld = true
+		sw.SetPaddle(1, 255)
+		return true
+	}
+	return false
+}
+
+// handleArrowKeyUp maps arrow key releases to virtual paddle positions.
+// If the opposite direction key is still held, that direction is maintained;
+// otherwise the axis snaps back to center (128).
+func handleArrowKeyUp(sym sdl.Keycode, sw *appleio.SoftSwitches) {
+	switch sym {
+	case sdl.K_LEFT:
+		leftHeld = false
+		if rightHeld {
+			sw.SetPaddle(0, 255)
+		} else {
+			sw.SetPaddle(0, 128)
+		}
+	case sdl.K_RIGHT:
+		rightHeld = false
+		if leftHeld {
+			sw.SetPaddle(0, 0)
+		} else {
+			sw.SetPaddle(0, 128)
+		}
+	case sdl.K_UP:
+		upHeld = false
+		if downHeld {
+			sw.SetPaddle(1, 255)
+		} else {
+			sw.SetPaddle(1, 128)
+		}
+	case sdl.K_DOWN:
+		downHeld = false
+		if upHeld {
+			sw.SetPaddle(1, 0)
+		} else {
+			sw.SetPaddle(1, 128)
+		}
+	}
+}
+
+// handleButtonKeyDown maps left-alt / right-alt to joystick button press.
+// Returns true if the key was consumed.
+func handleButtonKeyDown(sym sdl.Keycode, sw *appleio.SoftSwitches) bool {
+	switch sym {
+	case sdl.K_LALT:
+		sw.PressButton(0) // $C061 — punch / fire 1 (Open-Apple)
+		return true
+	case sdl.K_RALT:
+		sw.PressButton(1) // $C062 — kick / fire 2 (Closed-Apple)
+		return true
+	}
+	return false
+}
+
+// handleButtonKeyUp maps left-alt / right-alt to joystick button release.
+func handleButtonKeyUp(sym sdl.Keycode, sw *appleio.SoftSwitches) {
+	switch sym {
+	case sdl.K_LALT:
+		sw.ReleaseButton(0)
+	case sdl.K_RALT:
+		sw.ReleaseButton(1)
+	}
+}
+
+// handleTurboKeyDown / handleTurboKeyUp: F12 held = turbo on.
+// Hold-to-activate (not toggle) so releasing always returns to 60 fps.
+func handleTurboKeyDown(sym sdl.Keycode) bool {
+	if sym == sdl.K_F12 {
+		turboMode = true
+		return true
+	}
+	return false
+}
+
+func handleTurboKeyUp(sym sdl.Keycode) {
+	if sym == sdl.K_F12 {
+		turboMode = false
+	}
+}
+
+// buildTitle composes the SDL window title, showing FPS plus per-drive
+// activity indicators. dc may be nil if no disk image was loaded.
+//
+// Format examples:
+//
+//	Apple II Emulator — 60 fps                    (no disks)
+//	Apple II Emulator — 60 fps — [D1●]            (drive 1 reading)
+//	Apple II Emulator — 60 fps — [D1◉] [D2 ]      (drive 1 writing, drive 2 idle)
+//	Apple II Emulator — TURBO — [D1●]             (turbo engaged, drive 1 active)
+func buildTitle(fps int, dc *disk.Controller, turbo bool) string {
+	rate := fmt.Sprintf("%d fps", fps)
+	if turbo {
+		rate = "TURBO"
+	}
+	if dc == nil {
+		return fmt.Sprintf("Apple II Emulator — %s", rate)
+	}
+	parts := []string{}
+	for i := 0; i < 2; i++ {
+		if !dc.HasDisk(i) {
+			continue
+		}
+		glyph := " "
+		switch {
+		case dc.HadRecentWrite(i):
+			glyph = "◉" // write activity (higher priority than read)
+		case dc.HadRecentRead(i):
+			glyph = "●" // read activity
+		}
+		parts = append(parts, fmt.Sprintf("[D%d%s]", i+1, glyph))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("Apple II Emulator — %s", rate)
+	}
+	return fmt.Sprintf("Apple II Emulator — %s — %s", rate, strings.Join(parts, " "))
 }
 
 // loadROM detects the ROM size and sets the correct base address.

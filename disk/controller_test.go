@@ -3,6 +3,7 @@ package disk
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // newTestController returns a Controller wired to a uint64 cycle counter
@@ -265,4 +266,110 @@ func TestFlushOnMotorOff(t *testing.T) {
 		t.Fatalf("LoadImage after flush: %v", err)
 	}
 	// If we get here without panic the flush ran (may have decode errors for synthetic nibble; acceptable).
+}
+
+func TestHadRecentRead(t *testing.T) {
+	c, cyc := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS)
+
+	// Install a fake clock for deterministic testing.
+	// do not t.Parallel() — package-level nowFn is mutated here.
+	origNow := nowFn
+	fakeNow := time.Unix(1_700_000_000, 0)
+	nowFn = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFn = origNow })
+
+	// Motor on, drive 0 selected
+	strobe(c, 0x09) // MOTORON
+	strobe(c, 0x0A) // DRIVE1
+
+	// No reads yet → HadRecentRead false
+	if c.HadRecentRead(0) {
+		t.Fatal("expected no recent read before any Q6L access")
+	}
+
+	// Advance cycles enough for two nibbles, then read one.
+	*cyc = 64
+	_ = strobe(c, 0x0C) // Q6L read
+	if !c.HadRecentRead(0) {
+		t.Fatal("expected recent read after first successful nibble advance")
+	}
+
+	// Drive 1 never read → false
+	if c.HadRecentRead(1) {
+		t.Fatal("drive 1 had no activity, expected false")
+	}
+
+	// Invalid drive index
+	if c.HadRecentRead(-1) || c.HadRecentRead(2) {
+		t.Fatal("expected false for out-of-range drive")
+	}
+
+	// Advance fake clock past the 500ms wall-clock window.
+	fakeNow = fakeNow.Add(600 * time.Millisecond)
+	if c.HadRecentRead(0) {
+		t.Fatal("expected stale after 600ms of fake wall clock")
+	}
+}
+
+func TestHadRecentWrite(t *testing.T) {
+	c, cyc := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS) // mounts un-write-protected image
+
+	// do not t.Parallel() — package-level nowFn is mutated here.
+	origNow := nowFn
+	fakeNow := time.Unix(1_700_000_000, 0)
+	nowFn = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFn = origNow })
+
+	// Preconditions:
+	//   - motor on     (Strobe $C0E9 MOTORON)
+	//   - drive 0      (Strobe $C0EA DRIVE1)
+	//   - q7 = true    (Strobe $C0EF Q7H — WRITE mode)
+	//   - q6 = true    (Strobe $C0ED Q6H — LOAD LATCH)
+	//   - write not protected (mountTestImage default)
+	//   - image != nil (mountTestImage)
+	strobe(c, 0x09) // MOTORON
+	strobe(c, 0x0A) // DRIVE1
+	strobe(c, 0x0F) // Q7H
+	strobe(c, 0x0D) // Q6H (enters write-byte branch on next access)
+
+	// Advance cycles enough for the nibble-write step (32 cyc/nibble).
+	*cyc = 64
+
+	// Write the latch value then issue a strobe that triggers the commit.
+	// Q7=1, Q6=1 (write-run) via Q6L strobe: that's our write-run path.
+	// First latch the write byte via Q6H write:
+	sw := NewSwitches(c)
+	sw.Write(0xC0ED, 0xAA) // latch write byte
+	// Now trigger write-run: Q7=1, Q6=1, access Q6L
+	strobe(c, 0x0C) // Q6L while Q7=1, Q6=1 → write-run commits to track
+
+	if !c.HadRecentWrite(0) {
+		t.Fatal("expected recent write after successful write-byte commit")
+	}
+
+	// Advance fake clock past window.
+	fakeNow = fakeNow.Add(600 * time.Millisecond)
+	if c.HadRecentWrite(0) {
+		t.Fatal("expected stale after 600ms")
+	}
+}
+
+func TestHasDisk(t *testing.T) {
+	c, _ := newTestController(t)
+	if c.HasDisk(0) || c.HasDisk(1) {
+		t.Fatal("empty controller reports disks present")
+	}
+	mountTestImage(t, c, 0, OrderDOS)
+	if !c.HasDisk(0) {
+		t.Fatal("drive 0 should report present after mount")
+	}
+	if c.HasDisk(1) {
+		t.Fatal("drive 1 still empty")
+	}
+	// Out-of-range
+	if c.HasDisk(-1) || c.HasDisk(2) {
+		t.Fatal("HasDisk should return false for OOB indices")
+	}
 }

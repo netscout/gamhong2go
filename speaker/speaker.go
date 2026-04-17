@@ -233,6 +233,23 @@ func (s *Speaker) Enabled() bool { return s.enabled }
 // one frame worth of audio at EndFrame time. Test/debug only.
 func (s *Speaker) Underruns() uint64 { return s.underruns }
 
+// ClearAudioQueue drops any unconsumed samples from the SDL audio queue.
+// Used after turbo-mode release so the up-to-1s of fast-speed samples
+// doesn't play back at normal speed when turbo is released.
+//
+// Core Audio retains ~10-20ms in the OS buffer beyond SDL's queue; a
+// faint tail of fast-speed audio may still be audible for one buffer
+// cycle after release. Inaudible as a click in practice.
+//
+// Safe to call from the main goroutine while the audio device is running:
+// SDL2's ClearQueuedAudio takes an internal device mutex.
+func (s *Speaker) ClearAudioQueue() {
+	if !s.enabled || s.dev == 0 {
+		return
+	}
+	sdl.ClearQueuedAudio(s.dev)
+}
+
 // RenderSamples is a pure function. Given a sorted list of frame-
 // relative toggle cycles and the absolute global cycle/sample anchors,
 // produce the next nSamples PCM samples.

@@ -1,5 +1,7 @@
 package disk
 
+import "time"
+
 // drive holds the per-drive mechanical and magnetic state.
 type drive struct {
 	image     *diskImage
@@ -10,6 +12,19 @@ type drive struct {
 	nibbles   [tracksPerDisk][]uint8 // lazily GCR-encoded, one per track
 	nibblePos int
 	dirty     [tracksPerDisk]bool
+
+	// Activity tracking for the host UI window-title indicator.
+	// Stamped with nowFn() each time a real nibble passes the head.
+	// Read by HadRecentRead/HadRecentWrite against a wall-clock window
+	// so the indicator stays visible regardless of turbo/normal speed.
+	// Zero value (time.Time{}) means "never had activity".
+	//
+	// Single-goroutine access only (emulator is single-goroutine outside
+	// the SDL audio callback, which does not touch these fields). If a
+	// future refactor adds goroutines here, these reads/writes become
+	// racy and must be protected.
+	lastReadAt  time.Time
+	lastWriteAt time.Time
 }
 
 // stepPhase updates the half-track position when a stepper phase changes.

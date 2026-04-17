@@ -35,8 +35,9 @@ func TestBootPROM_LoadsT0S0(t *testing.T) {
 	expectedT0S0 := dskData[:256]
 
 	// Wire the bus exactly like main.go does.
+	var diskCycle uint64
 	ram := memory.NewRAM()
-	sw := appleio.NewSoftSwitches()
+	sw := appleio.NewSoftSwitches(&diskCycle)
 	b := bus.NewBus()
 
 	rom, err := memory.LoadROM(romPath, 0xD000)
@@ -48,7 +49,6 @@ func TestBootPROM_LoadsT0S0(t *testing.T) {
 	b.Map(0xC000, 0xC0FF, sw)
 	b.Map(rom.Base, rom.End(), rom)
 
-	var diskCycle uint64
 	dc := NewController(&diskCycle)
 	if err := dc.Mount(0, diskPath, ""); err != nil {
 		t.Fatalf("mount disk: %v", err)
