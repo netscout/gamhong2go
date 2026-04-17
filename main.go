@@ -163,17 +163,21 @@ func main() {
 	}
 	defer dc.Close() // flushes dirty tracks
 
-	// Softswitch window for slot 6: $C0E0-$C0EF (overlays SoftSwitches; last-wins).
-	b.Map(0xC0E0, 0xC0EF, disk.NewSwitches(dc))
+	// Slot 6 (Disk II) is only "installed" when a disk is mounted. On real
+	// hardware, no card → Autostart slot scan skips slot 6 → falls through to
+	// Applesoft BASIC. Without this gate, the PROM's nibble-wait loop at $C659
+	// hangs forever reading $FF from an empty drive.
+	if *disk1 != "" || *disk2 != "" {
+		b.Map(0xC0E0, 0xC0EF, disk.NewSwitches(dc))
 
-	// Boot PROM for slot 6: $C600-$C6FF.
-	prom, err := memory.LoadROM("roms/DISK2.rom", 0xC600)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "disk PROM: %v\n", err)
-		os.Exit(1)
+		prom, err := memory.LoadROM("roms/DISK2.rom", 0xC600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "disk PROM: %v\n", err)
+			os.Exit(1)
+		}
+		b.Map(prom.Base, prom.End(), prom)
+		fmt.Printf("Disk II PROM: roms/DISK2.rom (%d bytes at $%04X–$%04X)\n", prom.Size(), prom.Base, prom.End())
 	}
-	b.Map(prom.Base, prom.End(), prom)
-	fmt.Printf("Disk II PROM: roms/DISK2.rom (%d bytes at $%04X–$%04X)\n", prom.Size(), prom.Base, prom.End())
 
 	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
 
