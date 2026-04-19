@@ -45,7 +45,11 @@ func init() {
 }
 
 const (
-	tracksPerDisk   = 35
+	tracksPerDisk = 35
+	// maxHalfTrack is the highest legal halfTrack index. 35 tracks →
+	// halfTracks 0..69 (70 positions total); index 70 would map to
+	// track 35, out of bounds for nibbles[tracksPerDisk].
+	maxHalfTrack    = 2*tracksPerDisk - 1
 	sectorsPerTrack = 16
 	bytesPerSector  = 256
 

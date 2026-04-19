@@ -6,7 +6,7 @@ import "time"
 type drive struct {
 	image     *diskImage
 	phases    [4]bool
-	halfTrack int // 0..70; track = halfTrack/2
+	halfTrack int // 0..maxHalfTrack (69); track = halfTrack/2
 	motorOn   bool
 	writeProt bool
 	nibbles   [tracksPerDisk][]uint8 // lazily GCR-encoded, one per track
@@ -25,6 +25,11 @@ type drive struct {
 	// racy and must be protected.
 	lastReadAt  time.Time
 	lastWriteAt time.Time
+
+	// label is the cached display name for UI (title bar). Set by the
+	// controller in Mount/Swap/Eject — never written from the CPU-facing paths.
+	// Empty string when no image is mounted.
+	label string
 }
 
 // stepPhase updates the half-track position when a stepper phase changes.
@@ -43,8 +48,8 @@ func (d *drive) stepPhase(prev, next int) {
 	if d.halfTrack < 0 {
 		d.halfTrack = 0
 	}
-	if d.halfTrack > 70 {
-		d.halfTrack = 70
+	if d.halfTrack > maxHalfTrack {
+		d.halfTrack = maxHalfTrack
 	}
 }
 

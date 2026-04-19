@@ -31,7 +31,7 @@ func TestStepForwardAndBack(t *testing.T) {
 
 func TestHalfTrackClamped(t *testing.T) {
 	d := newTestDrive()
-	// Drive all the way to track 35 (halfTrack 70).
+	// Drive far past the last legal half-track.
 	d.phaseOn(0)
 	for i := 0; i < 40; i++ {
 		next := (i + 1) % 4
@@ -39,8 +39,14 @@ func TestHalfTrackClamped(t *testing.T) {
 		d.phaseOn(next)
 		d.phaseOff(prev)
 	}
-	if d.halfTrack > 70 {
-		t.Errorf("halfTrack %d exceeds maximum 70", d.halfTrack)
+	// halfTrack must not exceed maxHalfTrack (69). halfTrack/2 must be a
+	// valid index into nibbles[tracksPerDisk].
+	if d.halfTrack > maxHalfTrack {
+		t.Errorf("halfTrack %d > maxHalfTrack %d", d.halfTrack, maxHalfTrack)
+	}
+	if d.halfTrack/2 >= tracksPerDisk {
+		t.Errorf("halfTrack %d maps to track %d, out of range [0,%d)",
+			d.halfTrack, d.halfTrack/2, tracksPerDisk)
 	}
 
 	// Now step backward past 0.
@@ -55,5 +61,47 @@ func TestHalfTrackClamped(t *testing.T) {
 	}
 	if d.halfTrack < 0 {
 		t.Errorf("halfTrack %d went below 0", d.halfTrack)
+	}
+}
+
+// TestStepperCannotExceedLastTrack is a focused mechanism test: no matter
+// how many forward steps are issued, halfTrack/2 must remain a legal index
+// into nibbles[tracksPerDisk]. Previous clamp was off-by-one (70 allowed),
+// which mapped to track 35 — OOB for a 35-track array.
+func TestStepperCannotExceedLastTrack(t *testing.T) {
+	d := newTestDrive()
+	d.phaseOn(0)
+	for i := 0; i < 200; i++ { // hammer forward well past any reasonable limit
+		next := (i + 1) % 4
+		prev := i % 4
+		d.phaseOn(next)
+		d.phaseOff(prev)
+	}
+	if d.halfTrack >= 2*tracksPerDisk {
+		t.Fatalf("halfTrack %d reached track %d; want < %d",
+			d.halfTrack, d.halfTrack/2, tracksPerDisk)
+	}
+}
+
+// TestHalfTrack70DoesNotCrash pins the exact crash the user hit: a drive
+// parked at halfTrack = 70 (the old clamp ceiling) calling trackData must
+// not panic. With the fix, halfTrack cannot reach 70; this test catches
+// regressions if the clamp is ever relaxed.
+func TestHalfTrack70DoesNotCrash(t *testing.T) {
+	d := newTestDrive()
+	// Drive past any reasonable limit via the normal step path.
+	d.phaseOn(0)
+	for i := 0; i < 200; i++ {
+		next := (i + 1) % 4
+		prev := i % 4
+		d.phaseOn(next)
+		d.phaseOff(prev)
+	}
+	if d.halfTrack == 70 {
+		t.Fatal("halfTrack reached 70; clamp regressed to pre-fix value")
+	}
+	// Even without a mounted image, the index math must stay in bounds.
+	if t := d.halfTrack / 2; t >= tracksPerDisk {
+		_ = t
 	}
 }

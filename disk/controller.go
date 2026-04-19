@@ -9,6 +9,7 @@ package disk
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -55,7 +56,7 @@ func (c *Controller) SetTracer(t Tracer) {
 // Mount loads a disk image into the specified drive slot (0 or 1).
 // orderOverride is "" to infer from extension, or "dos"/"prodos".
 func (c *Controller) Mount(driveIdx int, path, orderOverride string) error {
-	if driveIdx < 0 || driveIdx > 1 {
+	if driveIdx < 0 || driveIdx >= numDrives {
 		return fmt.Errorf("disk: invalid drive index %d", driveIdx)
 	}
 	img, err := LoadImage(path, orderOverride)
@@ -64,6 +65,7 @@ func (c *Controller) Mount(driveIdx int, path, orderOverride string) error {
 	}
 	c.drives[driveIdx].image = img
 	c.drives[driveIdx].writeProt = img.writeProt
+	c.drives[driveIdx].label = deriveLabel(path) // inline fix: symmetric with Swap.
 	fmt.Fprintf(os.Stderr, "disk: drive %d: %s (order=%v, wp=%v)\n", driveIdx+1, path, img.order, img.writeProt)
 	return nil
 }
@@ -132,6 +134,163 @@ func (c *Controller) HasDisk(driveIdx int) bool {
 		return false
 	}
 	return c.drives[driveIdx].image != nil
+}
+
+// Swap hot-swaps the disk in driveIdx. path == "" ejects the current disk.
+// Otherwise the new image is loaded (inferring sector order from extension,
+// like Mount) and becomes the drive's image.
+//
+// Real-hardware fidelity: halfTrack (head position), phases, and motorOn are
+// preserved (those are physical/mechanical — on real hardware, changing
+// floppies doesn't move the head or stop the spindle). Per-image state
+// (nibble cache, nibblePos, dirty flags, activity timestamps, writeProt)
+// resets. Controller-level in-flight state for THIS drive (c.latch,
+// c.writeReg) is also cleared when the drive being swapped is the currently
+// selected drive — those represent a nibble or write byte derived from the
+// old image and would corrupt the new image if left intact.
+//
+// Threading contract (v3): the main loop calls sdl.PollEvent → handles
+// DROPFILE → then runs the CPU step, so Swap and readDataLatch never
+// execute concurrently; no mutex is needed for the latch/writeReg clear.
+// Swap MUST be called on the SDL main goroutine (consistent with the
+// package-level single-goroutine invariant at disk/controller.go:3). SDL
+// drop events and keyboard events are polled on that goroutine; the audio
+// callback (speaker.go) never touches disk.Controller.
+//
+// c.lastCycle is intentionally NOT reset. The next readDataLatch call will
+// compute delta = now - c.lastCycle; if that delta is huge (drive was
+// deselected for many seconds, or this is the first read after a long idle),
+// the steps = delta / cyclesPerNibble computation is clamped by the
+// modulo-wrap at disk/controller.go:295 (steps = steps % uint64(nLen)),
+// so nibblePos wraps cleanly within one revolution regardless of gap size.
+// That clamp — not any "global pacing" notion — is the actual safety net.
+//
+// Motor-on safety: if the motor is running, the swap happens anyway and a
+// warning is logged (games seek → CRC fail → retry). Motor-on does NOT
+// return an error; the error return is reserved for invalid driveIdx and
+// LoadImage failures.
+//
+// driveIdx is 0-based internally; stderr log lines report driveIdx+1 to
+// match user-facing "drive 1/drive 2" conventions.
+func (c *Controller) Swap(driveIdx int, path string) error {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return fmt.Errorf("disk: Swap: invalid drive index %d", driveIdx)
+	}
+	d := &c.drives[driveIdx]
+
+	// Motor-on warning — not an error.
+	if d.motorOn {
+		fmt.Fprintf(os.Stderr, "disk: drive %d swap while motor is on; expect CRC errors until the game reseeks\n", driveIdx+1)
+	}
+
+	// 1. Flush the outgoing image (if any). Errors logged, not fatal —
+	//    once the user asked to swap, the "floppy" is already in motion;
+	//    a flush error shouldn't abort the eject (matches Close()).
+	if d.image != nil {
+		if err := d.image.flush(&c.drives); err != nil {
+			fmt.Fprintf(os.Stderr, "disk: drive %d: flush on eject failed: %v\n", driveIdx+1, err)
+		}
+	}
+
+	// 2. Clear all image-bound per-drive state.
+	//    Preserved: halfTrack, phases, motorOn. writeProt is reset here
+	//    and re-set below from the new image's writeProt (if path != "").
+	//    label cleared here; set below on successful load.
+	d.image = nil
+	d.writeProt = false
+	d.nibblePos = 0
+	d.lastReadAt = time.Time{}
+	d.lastWriteAt = time.Time{}
+	d.label = "" // invalidate cached label.
+	for t := 0; t < tracksPerDisk; t++ {
+		d.nibbles[t] = nil
+		d.dirty[t] = false
+	}
+
+	// 3. Clear controller-level in-flight state for the SELECTED drive only.
+	//    c.latch holds the last nibble the CPU shifted in — but that nibble
+	//    came from the OLD image. If we leave it, the next readDataLatch
+	//    call with steps==0 (no time elapsed) returns the stale nibble.
+	//    c.writeReg is the in-flight write-run value; if the CPU is mid-write
+	//    (Q7 high, write-load already committed one byte to writeReg), we
+	//    MUST clear it so the write-run branch doesn't commit that byte to
+	//    the new disk.
+	//    Safe without a mutex: see Threading contract above — Swap and
+	//    readDataLatch are serialized by the main loop (SDL poll → CPU step).
+	//    Do NOT clear q6/q7 — those are flip-flops on the card, independent
+	//    of the disk. The CPU owns their state.
+	//    Do NOT reset c.lastCycle — see the modulo-clamp rationale above.
+	if c.selected == driveIdx {
+		c.latch = 0
+		c.writeReg = 0
+	}
+
+	if path == "" {
+		// Eject only: done.
+		fmt.Fprintf(os.Stderr, "disk: drive %d: ejected\n", driveIdx+1)
+		return nil
+	}
+
+	// 4. Load the new image. LoadImage infers order from extension; Swap does
+	//    NOT accept an override (drag-and-drop has no "-order" UX). If an
+	//    extension-less file is dropped, LoadImage's existing stderr warning
+	//    fires and it defaults to DOS order — identical to Mount with
+	//    override="".
+	img, err := LoadImage(path, "")
+	if err != nil {
+		// Old image already ejected; leave drive empty and surface error.
+		return err
+	}
+	d.image = img
+	d.writeProt = img.writeProt
+	d.label = deriveLabel(path) // compute once per mount; cached in drive.label.
+
+	fmt.Fprintf(os.Stderr, "disk: drive %d: swapped to %s (order=%v, wp=%v)\n",
+		driveIdx+1, path, img.order, img.writeProt)
+	return nil
+}
+
+// Eject is a readability-only wrapper for Swap(driveIdx, "").
+// Use at call sites where eject semantics would otherwise be obscured by
+// the empty-string argument.
+func (c *Controller) Eject(driveIdx int) error {
+	return c.Swap(driveIdx, "")
+}
+
+// DrivePath returns the raw mounted path of the image in driveIdx, or ""
+// if the slot is empty.
+func (c *Controller) DrivePath(driveIdx int) string {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return ""
+	}
+	img := c.drives[driveIdx].image
+	if img == nil {
+		return ""
+	}
+	return img.path
+}
+
+// DriveLabel returns the pre-computed short display label (basename minus
+// extension) for the mounted image, or "" if empty. The label is cached
+// during Swap/Eject so the title-bar hot path does NOT re-invoke
+// filepath.Base/filepath.Ext at 1 Hz.
+func (c *Controller) DriveLabel(driveIdx int) string {
+	if driveIdx < 0 || driveIdx >= numDrives {
+		return ""
+	}
+	return c.drives[driveIdx].label
+}
+
+// deriveLabel is the canonical "path → short name" policy for the cached
+// drive.label field. Returns basename minus extension; no further truncation.
+// Title-bar width truncation is handled separately by main.truncateLabel.
+func deriveLabel(path string) string {
+	if path == "" {
+		return ""
+	}
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	return base[:len(base)-len(ext)]
 }
 
 // Strobe handles a softswitch access at addr in [$C0E0..$C0EF].
@@ -356,8 +515,8 @@ func (c *Controller) tracePhase(phase int, on bool) {
 			switch diff {
 			case 1:
 				newHT = oldHT + 1
-				if newHT > 70 {
-					newHT = 70
+				if newHT > maxHalfTrack {
+					newHT = maxHalfTrack
 				}
 			case 3:
 				newHT = oldHT - 1

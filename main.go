@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unsafe"
@@ -100,6 +101,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "SDL init failed: %v\n", err)
 		os.Exit(1)
 	}
+	// Explicitly enable drag-and-drop events. macOS defaults-on, but Linux
+	// X11/Wayland does not guarantee this. Cite go-sdl2@v0.4.40/sdl/events.go:1357.
+	sdl.EventState(sdl.DROPFILE, sdl.ENABLE)
 	defer sdl.Quit()
 
 	window, err := sdl.CreateWindow(
@@ -165,6 +169,54 @@ func main() {
 	if *diskTrace {
 		dc.SetTracer(disk.NewStderrTracer(os.Stderr, *diskTraceN))
 	}
+	defer dc.Close() // flushes dirty tracks
+
+	// installDiskCard wires the Disk II slot-6 PROM and softswitches. It is
+	// idempotent: once installed, subsequent calls are no-ops. Called at
+	// startup (if any disk flag was given) and lazily on drag-and-drop so a
+	// user who launches with no -disk1/-disk2 flag can drop a disk mid-session.
+	//
+	// Ordering: PROM load first. If it fails, bail BEFORE mapping softswitches
+	// (avoids a half-installed card whose PROM region is blank). promFailed
+	// rate-limits stderr: first failure is verbose, subsequent failures are terse
+	// so three consecutive drops with a missing DISK2.rom produce one detailed
+	// line + two terse lines, not three identical long lines.
+	var (
+		diskCardInstalled bool
+		promFailed        bool
+	)
+	installDiskCard := func() {
+		if diskCardInstalled {
+			return
+		}
+
+		// PROM first — if this fails, bail without wiring the softswitches.
+		prom, err := memory.LoadROM("roms/DISK2.rom", 0xC600)
+		if err != nil {
+			if !promFailed {
+				fmt.Fprintf(os.Stderr, "disk PROM: %v (card not installed)\n", err)
+				promFailed = true
+			} else {
+				fmt.Fprintln(os.Stderr, "disk PROM: still missing — install failed on prior attempt")
+			}
+			return
+		}
+		b.Map(prom.Base, prom.End(), prom)
+
+		// PROM succeeded: now safe to map the softswitches and flip the flag.
+		b.Map(0xC0E0, 0xC0EF, disk.NewSwitches(dc))
+
+		fmt.Printf("Disk II PROM: roms/DISK2.rom (%d bytes at $%04X–$%04X)\n",
+			prom.Size(), prom.Base, prom.End())
+		diskCardInstalled = true
+		promFailed = false // reset on success so future attempts are not silenced
+	}
+
+	// Startup: install the card only if a flag was set. Preserves the no-disk
+	// Applesoft fall-through behaviour when neither -disk1 nor -disk2 is given.
+	if *disk1 != "" || *disk2 != "" {
+		installDiskCard()
+	}
 	if *disk1 != "" {
 		if err := dc.Mount(0, *disk1, *order); err != nil {
 			fmt.Fprintf(os.Stderr, "disk1: %v\n", err)
@@ -179,23 +231,6 @@ func main() {
 		}
 		fmt.Printf("Disk 2: %s\n", *disk2)
 	}
-	defer dc.Close() // flushes dirty tracks
-
-	// Slot 6 (Disk II) is only "installed" when a disk is mounted. On real
-	// hardware, no card → Autostart slot scan skips slot 6 → falls through to
-	// Applesoft BASIC. Without this gate, the PROM's nibble-wait loop at $C659
-	// hangs forever reading $FF from an empty drive.
-	if *disk1 != "" || *disk2 != "" {
-		b.Map(0xC0E0, 0xC0EF, disk.NewSwitches(dc))
-
-		prom, err := memory.LoadROM("roms/DISK2.rom", 0xC600)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "disk PROM: %v\n", err)
-			os.Exit(1)
-		}
-		b.Map(prom.Base, prom.End(), prom)
-		fmt.Printf("Disk II PROM: roms/DISK2.rom (%d bytes at $%04X–$%04X)\n", prom.Size(), prom.Base, prom.End())
-	}
 
 	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
 
@@ -206,12 +241,22 @@ func main() {
 
 	for running {
 		frameStart := time.Now()
+		// droppedThisFrame gates multi-file drops: only the first DROPFILE per
+		// host frame is processed. Declared here (not module-scope) so it resets
+		// per frame; the inner PollEvent loop drains all queued events.
+		droppedThisFrame := false
 
 		// 1. Poll SDL events (keyboard, quit)
 		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 			switch e := event.(type) {
 			case *sdl.QuitEvent:
 				running = false
+
+			case *sdl.DropEvent:
+				if e.Type == sdl.DROPFILE && !droppedThisFrame {
+					droppedThisFrame = true
+					handleDropFile(e.File, dc, installDiskCard)
+				}
 
 			case *sdl.KeyboardEvent:
 				switch e.Type {
@@ -224,6 +269,10 @@ func main() {
 					// Ctrl+R to reset (no audio interference: buffers drain naturally)
 					if e.Keysym.Sym == sdl.K_r && e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
 						c.Reset()
+						break
+					}
+					// Ctrl+1 / Ctrl+2 eject the respective drive.
+					if handleDiskEjectKey(e.Keysym.Sym, e.Keysym.Mod, dc) {
 						break
 					}
 					// F12 turbo mode (hold to activate)
@@ -539,15 +588,38 @@ func handleTurboKeyUp(sym sdl.Keycode) {
 	}
 }
 
+// labelMax is the rune-width budget for a disk label in the window title.
+// 8 runes fits "karateka" exactly; longer names are truncated by truncateLabel.
+const labelMax = 8
+
+// truncateLabel applies the title-bar rune-width budget to a label already
+// derived by disk.DriveLabel (basename without extension). Truncates to
+// maxRunes using rune slicing so multi-byte UTF-8 filenames don't get
+// corrupted mid-sequence. Returns "" if label is empty (empty drive).
+// If maxRunes <= 0, returns label unmodified.
+func truncateLabel(label string, maxRunes int) string {
+	if label == "" {
+		return ""
+	}
+	if maxRunes <= 0 {
+		return label
+	}
+	runes := []rune(label)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return label
+}
+
 // buildTitle composes the SDL window title, showing FPS plus per-drive
 // activity indicators. dc may be nil if no disk image was loaded.
 //
 // Format examples:
 //
-//	Apple II Emulator — 60 fps                    (no disks)
-//	Apple II Emulator — 60 fps — [D1●]            (drive 1 reading)
-//	Apple II Emulator — 60 fps — [D1◉] [D2 ]      (drive 1 writing, drive 2 idle)
-//	Apple II Emulator — TURBO — [D1●]             (turbo engaged, drive 1 active)
+//	Apple II Emulator — 60 fps                         (no disks)
+//	Apple II Emulator — 60 fps — [D1:karateka ●]       (drive 1 reading)
+//	Apple II Emulator — 60 fps — [D1:dos33 ◉] [D2 ]   (drive 1 writing, drive 2 idle)
+//	Apple II Emulator — TURBO — [D1:karateka ●]        (turbo engaged, drive 1 active)
 func buildTitle(fps int, dc *disk.Controller, turbo bool) string {
 	rate := fmt.Sprintf("%d fps", fps)
 	if turbo {
@@ -568,12 +640,114 @@ func buildTitle(fps int, dc *disk.Controller, turbo bool) string {
 		case dc.HadRecentRead(i):
 			glyph = "●" // read activity
 		}
-		parts = append(parts, fmt.Sprintf("[D%d%s]", i+1, glyph))
+		// DriveLabel returns the pre-computed basename-minus-ext (no filepath
+		// calls here at title cadence). truncateLabel applies the rune budget.
+		label := truncateLabel(dc.DriveLabel(i), labelMax)
+		if label != "" {
+			parts = append(parts, fmt.Sprintf("[D%d:%s %s]", i+1, label, glyph))
+		} else {
+			parts = append(parts, fmt.Sprintf("[D%d%s]", i+1, glyph))
+		}
 	}
 	if len(parts) == 0 {
 		return fmt.Sprintf("Apple II Emulator — %s", rate)
 	}
 	return fmt.Sprintf("Apple II Emulator — %s — %s", rate, strings.Join(parts, " "))
+}
+
+// handleDropFile is called when the user drags a file onto the window.
+// Drive selection: the left half of the window maps to drive 1, the right
+// half to drive 2. SHIFT held at drop time also forces drive 2 — useful for
+// within-app drags where keyboard focus is reliable. File extension must be
+// one of .dsk/.do/.po (case-insensitive); anything else is rejected with a
+// stderr warning.
+//
+// Position-based selection exists because on macOS cross-app drags (e.g.
+// Finder → our window) the source app owns keyboard focus, so SDL's
+// GetKeyboardState() returns a stale snapshot and SHIFT is not observable.
+// The mouse position at drop is always accurate.
+//
+// MUST be called on the SDL main goroutine (same invariant as the rest of
+// the event-loop handlers).
+//
+// installCard is a closure that wires the slot-6 PROM + softswitches if not
+// already installed (see installDiskCard). Allows launching with no -disk1/-disk2
+// flags and later dropping a disk to bring the card online. After the card is
+// installed mid-session, the user must press Ctrl+R to re-run the PROM slot scan.
+func handleDropFile(path string, dc *disk.Controller, installCard func()) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".dsk", ".do", ".po":
+		// accepted
+	default:
+		fmt.Fprintf(os.Stderr, "disk: drop rejected — unsupported extension %q (expected .dsk/.do/.po)\n", ext)
+		return
+	}
+
+	driveIdx := dropDriveFromPosition()
+	if isShiftHeld() {
+		driveIdx = 1
+	}
+
+	installCard()
+
+	if err := dc.Swap(driveIdx, path); err != nil {
+		// Swap atomically ejects the old image before attempting the new load,
+		// so a load failure leaves the drive empty. Tell the user so they
+		// aren't surprised that the previously-working disk is gone.
+		fmt.Fprintf(os.Stderr, "disk: swap into drive %d failed: %v — drive is now empty\n", driveIdx+1, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "disk: drive %d loaded %s — press Ctrl+R to reboot\n",
+		driveIdx+1, dc.DriveLabel(driveIdx))
+}
+
+// isShiftHeld returns true if either Shift key is currently down at the
+// moment the drop event is processed. Reliable for within-app drags; on
+// macOS cross-app drags (Finder → emulator) the source app owns focus
+// and the snapshot is stale — see dropDriveFromPosition for the primary
+// selector. Verified: go-sdl2@v0.4.40/sdl/keyboard.go:47.
+func isShiftHeld() bool {
+	st := sdl.GetKeyboardState()
+	return st[sdl.SCANCODE_LSHIFT] != 0 || st[sdl.SCANCODE_RSHIFT] != 0
+}
+
+// dropDriveFromPosition returns 0 (drive 1) if the mouse is in the left
+// half of the emulator window at drop time, else 1 (drive 2). Mouse
+// position is always accurate even when keyboard focus is elsewhere, so
+// this is the primary drive selector for cross-app drag-drops from Finder.
+func dropDriveFromPosition() int {
+	x, _, _ := sdl.GetMouseState()
+	if x < int32(windowW/2) {
+		return 0
+	}
+	return 1
+}
+
+// handleDiskEjectKey ejects a disk when Ctrl+1 / Ctrl+2 is pressed.
+// Returns true if the key was consumed so the caller does not emit it as
+// a character code.
+func handleDiskEjectKey(sym sdl.Keycode, mod uint16, dc *disk.Controller) bool {
+	if mod&sdl.KMOD_CTRL == 0 {
+		return false
+	}
+	driveIdx := -1
+	switch sym {
+	case sdl.K_1:
+		driveIdx = 0
+	case sdl.K_2:
+		driveIdx = 1
+	default:
+		return false
+	}
+	if !dc.HasDisk(driveIdx) {
+		fmt.Fprintf(os.Stderr, "disk: drive %d already empty\n", driveIdx+1)
+		return true
+	}
+	if err := dc.Eject(driveIdx); err != nil {
+		fmt.Fprintf(os.Stderr, "disk: eject drive %d failed: %v\n", driveIdx+1, err)
+	}
+	return true
 }
 
 // loadROM detects the ROM size and sets the correct base address.

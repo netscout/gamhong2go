@@ -2,6 +2,7 @@ package disk
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -371,5 +372,339 @@ func TestHasDisk(t *testing.T) {
 	// Out-of-range
 	if c.HasDisk(-1) || c.HasDisk(2) {
 		t.Fatal("HasDisk should return false for OOB indices")
+	}
+}
+
+func TestSwapPreservesHalfTrack(t *testing.T) {
+	c, _ := newTestController(t)
+	p1 := mountTestImage(t, c, 0, OrderDOS)
+	_ = p1
+
+	// Move the head to halfTrack 34 (track 17) and latch a mid-read state.
+	c.drives[0].halfTrack = 34
+	c.drives[0].phases = [4]bool{false, true, false, false}
+	c.drives[0].motorOn = true
+
+	p2, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, p2); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	if c.drives[0].halfTrack != 34 {
+		t.Errorf("halfTrack after swap = %d, want 34 (head should not move)", c.drives[0].halfTrack)
+	}
+	if c.drives[0].phases[1] != true {
+		t.Error("phases cleared by Swap; expected preserved")
+	}
+	if !c.drives[0].motorOn {
+		t.Error("motorOn cleared by Swap; expected preserved (motor keeps spinning)")
+	}
+	if c.drives[0].image == nil {
+		t.Fatal("image should be set after Swap")
+	}
+}
+
+func TestSwapResetsImageBoundState(t *testing.T) {
+	c, cyc := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS)
+
+	origNow := nowFn
+	fakeNow := time.Unix(1_700_000_000, 0)
+	nowFn = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFn = origNow })
+
+	strobe(c, 0x09) // MOTORON
+	strobe(c, 0x0E) // Q7L (read mode)
+	*cyc += cyclesPerNibble * 5
+	for i := 0; i < 5; i++ {
+		_ = strobe(c, 0x0C)
+	}
+	if c.drives[0].nibbles[0] == nil {
+		t.Fatal("expected nibbles[0] cache populated by reads")
+	}
+	if c.drives[0].nibblePos == 0 {
+		t.Fatal("expected nibblePos advanced")
+	}
+	if c.drives[0].lastReadAt.IsZero() {
+		t.Fatal("expected lastReadAt stamped")
+	}
+
+	c.drives[0].dirty[3] = true
+
+	p2, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, p2); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+
+	if c.drives[0].nibblePos != 0 {
+		t.Errorf("nibblePos = %d after Swap, want 0", c.drives[0].nibblePos)
+	}
+	for tt := 0; tt < tracksPerDisk; tt++ {
+		if c.drives[0].nibbles[tt] != nil {
+			t.Errorf("nibbles[%d] not cleared after Swap", tt)
+		}
+		if c.drives[0].dirty[tt] {
+			t.Errorf("dirty[%d] not cleared after Swap", tt)
+		}
+	}
+	if !c.drives[0].lastReadAt.IsZero() {
+		t.Error("lastReadAt not cleared after Swap")
+	}
+	if !c.drives[0].lastWriteAt.IsZero() {
+		t.Error("lastWriteAt not cleared after Swap")
+	}
+	// Verify c.latch/c.writeReg cleared on selected-drive swap.
+	if c.latch != 0 {
+		t.Errorf("c.latch = %02X after swap, want 0 (stale old-disk nibble must be cleared)", c.latch)
+	}
+	if c.writeReg != 0 {
+		t.Errorf("c.writeReg = %02X after swap, want 0 (in-flight write must not bleed to new disk)", c.writeReg)
+	}
+}
+
+func TestSwapInvalidDriveReturnsError(t *testing.T) {
+	c, _ := newTestController(t)
+	for _, idx := range []int{-1, 2, 100} {
+		if err := c.Swap(idx, ""); err == nil {
+			t.Errorf("Swap(%d, \"\") returned nil; want error", idx)
+		}
+	}
+}
+
+func TestSwapBadPathLeavesDriveEmpty(t *testing.T) {
+	c, _ := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS)
+	err := c.Swap(0, "/definitely/does/not/exist.dsk")
+	if err == nil {
+		t.Fatal("expected error from bad path")
+	}
+	if c.HasDisk(0) {
+		t.Fatal("drive should be empty when swap fails to load new image (old image already ejected)")
+	}
+}
+
+func TestSwapInfersSectorOrder(t *testing.T) {
+	c, _ := newTestController(t)
+	pDOS, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, pDOS); err != nil {
+		t.Fatal(err)
+	}
+	if c.drives[0].image.order != OrderDOS {
+		t.Errorf(".dsk → order = %v, want OrderDOS", c.drives[0].image.order)
+	}
+	pPO, _ := makeTestImage(t, OrderProDOS)
+	if err := c.Swap(0, pPO); err != nil {
+		t.Fatal(err)
+	}
+	if c.drives[0].image.order != OrderProDOS {
+		t.Errorf(".po → order = %v, want OrderProDOS", c.drives[0].image.order)
+	}
+}
+
+func TestSwapDoubleRoundTrip(t *testing.T) {
+	c, cyc := newTestController(t)
+
+	origNow := nowFn
+	fakeNow := time.Unix(1_700_000_000, 0)
+	nowFn = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFn = origNow })
+
+	pA := mountTestImage(t, c, 0, OrderDOS)
+	pB, _ := makeTestImage(t, OrderDOS)
+
+	c.drives[0].halfTrack = 30
+	strobe(c, 0x09)
+	strobe(c, 0x0E)
+	*cyc += cyclesPerNibble * 3
+	_ = strobe(c, 0x0C)
+
+	// A → B
+	if err := c.Swap(0, pB); err != nil {
+		t.Fatalf("A→B swap: %v", err)
+	}
+	if c.drives[0].halfTrack != 30 {
+		t.Errorf("halfTrack after A→B = %d, want 30", c.drives[0].halfTrack)
+	}
+	if !c.drives[0].lastReadAt.IsZero() {
+		t.Error("lastReadAt must reset on A→B")
+	}
+	*cyc += cyclesPerNibble * 3
+	_ = strobe(c, 0x0C)
+
+	// B → A
+	if err := c.Swap(0, pA); err != nil {
+		t.Fatalf("B→A swap: %v", err)
+	}
+	if c.drives[0].halfTrack != 30 {
+		t.Errorf("halfTrack after B→A = %d, want 30 (preserved across two swaps)", c.drives[0].halfTrack)
+	}
+	if !c.drives[0].lastReadAt.IsZero() {
+		t.Error("lastReadAt must reset on B→A (no B-era stamp leak)")
+	}
+	if c.drives[0].nibblePos != 0 {
+		t.Errorf("nibblePos after B→A = %d, want 0", c.drives[0].nibblePos)
+	}
+}
+
+func TestSwapReadAfterSwapReturnsNewImageNibble(t *testing.T) {
+	c, cyc := newTestController(t)
+
+	origNow := nowFn
+	fakeNow := time.Unix(1_700_000_000, 0)
+	nowFn = func() time.Time { return fakeNow }
+	t.Cleanup(func() { nowFn = origNow })
+
+	mountTestImage(t, c, 0, OrderDOS)
+	strobe(c, 0x09) // MOTORON
+	strobe(c, 0x0E) // Q7L (read)
+
+	// Prime the latch with a byte from disk A.
+	*cyc += cyclesPerNibble * 5
+	latchedA := strobe(c, 0x0C)
+	if latchedA == 0 {
+		t.Fatalf("expected non-zero nibble from disk A, got 0")
+	}
+	if c.latch == 0 {
+		t.Fatal("c.latch should be populated after read")
+	}
+
+	// Swap to disk B.
+	pB, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, pB); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	// c.latch must have been cleared on swap.
+	if c.latch != 0 {
+		t.Errorf("c.latch not cleared on swap: 0x%02X", c.latch)
+	}
+
+	// Read again: must return a fresh nibble from disk B. Valid GCR nibbles
+	// always have bit 7 set (by construction of the gcr62 table); a clear
+	// bit 7 would mean no advance occurred and the (zeroed) latch leaked out.
+	*cyc += cyclesPerNibble * 5
+	latchedB := strobe(c, 0x0C)
+	if latchedB&0x80 == 0 {
+		t.Errorf("post-swap read = 0x%02X; bit 7 not set — fresh nibble from disk B expected", latchedB)
+	}
+	_ = latchedA // silence: we don't need to compare A vs B; the latch-clear invariant above is the observable test.
+}
+
+func TestSwapPreservesLastCycle(t *testing.T) {
+	c, cyc := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS)
+
+	strobe(c, 0x09) // MOTORON
+	strobe(c, 0x0E) // Q7L (read mode)
+	*cyc = 500
+	_ = strobe(c, 0x0C)
+	preLastCycle := c.lastCycle
+	if preLastCycle == 0 {
+		t.Fatal("lastCycle not advanced by initial read")
+	}
+
+	pB, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, pB); err != nil {
+		t.Fatal(err)
+	}
+	// The modulo-clamp at controller.go:295 is the actual safety net; Swap
+	// must not touch lastCycle or the next read would mis-pace relative to
+	// the CPU's cycle counter.
+	if c.lastCycle != preLastCycle {
+		t.Errorf("lastCycle changed by Swap: %d → %d; expected preserved", preLastCycle, c.lastCycle)
+	}
+}
+
+func TestSwapEjectMakesHasDiskFalse(t *testing.T) {
+	c, _ := newTestController(t)
+	mountTestImage(t, c, 0, OrderDOS)
+	if !c.HasDisk(0) {
+		t.Fatal("precondition: HasDisk(0) true after mount")
+	}
+	if err := c.Eject(0); err != nil {
+		t.Fatal(err)
+	}
+	if c.HasDisk(0) {
+		t.Fatal("HasDisk(0) should be false after Eject")
+	}
+}
+
+func TestDrivePath(t *testing.T) {
+	c, _ := newTestController(t)
+	if p := c.DrivePath(0); p != "" {
+		t.Errorf("empty slot DrivePath = %q, want \"\"", p)
+	}
+	mounted := mountTestImage(t, c, 0, OrderDOS)
+	if got := c.DrivePath(0); got != mounted {
+		t.Errorf("DrivePath = %q, want %q", got, mounted)
+	}
+	if err := c.Eject(0); err != nil {
+		t.Fatal(err)
+	}
+	if p := c.DrivePath(0); p != "" {
+		t.Errorf("DrivePath after Eject = %q, want \"\"", p)
+	}
+	if p := c.DrivePath(-1); p != "" {
+		t.Error("OOB negative should be \"\"")
+	}
+	if p := c.DrivePath(numDrives); p != "" {
+		t.Error("OOB high should be \"\"")
+	}
+}
+
+func TestSwapEjectEmptyDriveNoOp(t *testing.T) {
+	c, _ := newTestController(t)
+	if c.HasDisk(0) {
+		t.Fatal("precondition: drive 0 empty")
+	}
+	if err := c.Swap(0, ""); err != nil {
+		t.Errorf("Swap(0, \"\") on empty drive returned error: %v", err)
+	}
+	if c.HasDisk(0) {
+		t.Fatal("drive should still be empty")
+	}
+	if err := c.Eject(1); err != nil {
+		t.Errorf("Eject(1) on empty drive returned error: %v", err)
+	}
+}
+
+func TestDriveLabelCached(t *testing.T) {
+	c, _ := newTestController(t)
+
+	if lbl := c.DriveLabel(0); lbl != "" {
+		t.Errorf("empty slot DriveLabel = %q, want \"\"", lbl)
+	}
+
+	// mountTestImage uses Mount which now populates label (inline fix applied).
+	pA := mountTestImage(t, c, 0, OrderDOS)
+	gotMount := c.DriveLabel(0)
+	wantMount := filepath.Base(pA)
+	wantMount = wantMount[:len(wantMount)-len(filepath.Ext(wantMount))]
+	if gotMount != wantMount {
+		t.Errorf("DriveLabel after Mount = %q, want %q", gotMount, wantMount)
+	}
+
+	// Swap to a new image and verify label updates.
+	pB, _ := makeTestImage(t, OrderDOS)
+	if err := c.Swap(0, pB); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	got := c.DriveLabel(0)
+	want := filepath.Base(pB)
+	want = want[:len(want)-len(filepath.Ext(want))]
+	if got != want {
+		t.Errorf("DriveLabel after Swap = %q, want %q", got, want)
+	}
+
+	if err := c.Eject(0); err != nil {
+		t.Fatalf("Eject: %v", err)
+	}
+	if lbl := c.DriveLabel(0); lbl != "" {
+		t.Errorf("DriveLabel after Eject = %q, want \"\"", lbl)
+	}
+
+	if lbl := c.DriveLabel(-1); lbl != "" {
+		t.Error("OOB negative should be \"\"")
+	}
+	if lbl := c.DriveLabel(2); lbl != "" {
+		t.Error("OOB high should be \"\"")
 	}
 }
