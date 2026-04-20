@@ -51,7 +51,18 @@ func main() {
 	order := flag.String("order", "", "Sector order override: dos | prodos (default: infer from extension)")
 	diskTrace := flag.Bool("disktrace", false, "Log disk activity to stderr (rate-limited to 200 nibble reads)")
 	diskTraceN := flag.Int("disktracen", 200, "Max nibble-read lines to emit when -disktrace is set (0 = unlimited)")
+	paddle := flag.String("paddle", "arrows", "Arrow-key mode: 'arrows' (drive virtual paddle) or 'off' (send Apple II cursor codes $08/$15/$0B/$0A to keyboard)")
 	flag.Parse()
+
+	switch *paddle {
+	case "arrows":
+		paddleArrows = true
+	case "off":
+		paddleArrows = false
+	default:
+		fmt.Fprintf(os.Stderr, "Error: -paddle must be 'arrows' or 'off', got %q\n", *paddle)
+		os.Exit(1)
+	}
 
 	if *volume < 0 || *volume > 1 {
 		fmt.Fprintf(os.Stderr, "warning: -volume %.3f out of [0,1], clamping\n", *volume)
@@ -249,7 +260,7 @@ func main() {
 		fmt.Printf("Disk 2: %s\n", *disk2)
 	}
 
-	fmt.Println("Running... (Esc to quit, Ctrl+R to reset)")
+	fmt.Println("Running... (Shift+Esc to quit, Ctrl+R to reset)")
 
 	// --- Main loop ----------------------------------------------------------
 	running := true
@@ -278,8 +289,10 @@ func main() {
 			case *sdl.KeyboardEvent:
 				switch e.Type {
 				case sdl.KEYDOWN:
-					// Escape to quit
-					if e.Keysym.Sym == sdl.K_ESCAPE {
+					// Shift+Esc quits; plain Esc is forwarded to the Apple II
+					// ($1B) because games like Ultima IV use it for prompts.
+					// Cmd+Q / window-close also quit via sdl.QuitEvent.
+					if e.Keysym.Sym == sdl.K_ESCAPE && e.Keysym.Mod&sdl.KMOD_SHIFT != 0 {
 						running = false
 						break
 					}
@@ -422,6 +435,8 @@ func sdlKeyToApple(e *sdl.KeyboardEvent) uint8 {
 		return 0x7F
 	case sdl.K_TAB:
 		return 0x09
+	case sdl.K_ESCAPE:
+		return 0x1B
 	}
 	// Note: arrow keys (K_LEFT, K_RIGHT, K_UP, K_DOWN) are intentionally NOT
 	// mapped here — they drive the virtual paddle via handleArrowKey* instead.
@@ -499,6 +514,11 @@ var (
 	upHeld, downHeld    bool
 )
 
+// paddleArrows is set from the -paddle flag at startup.
+// true  → arrow keys drive the virtual paddle (default).
+// false → arrow keys emit Apple II cursor codes ($08/$15/$0B/$0A) to the keyboard latch.
+var paddleArrows = true
+
 // turboMode is toggled by F12. While true, the frame cap is bypassed so
 // the CPU emulation speed scales with host capacity. Render still happens
 // every frame; frame-skip is a future tuning knob only useful if profiling
@@ -506,9 +526,29 @@ var (
 var turboMode bool
 var prevTurbo bool
 
-// handleArrowKeyDown maps arrow key presses to virtual paddle positions.
+// handleArrowKeyDown maps arrow key presses.
+// With -paddle=arrows: drives the virtual paddle axes.
+// With -paddle=off:    emits Apple II cursor codes to the keyboard latch
+// ($08 left, $15 right, $0B up, $0A down — same mapping real IIe hardware uses).
 // Returns true if the key was consumed (caller should not pass to sdlKeyToApple).
 func handleArrowKeyDown(sym sdl.Keycode, sw *appleio.SoftSwitches) bool {
+	if !paddleArrows {
+		switch sym {
+		case sdl.K_LEFT:
+			sw.PressKey(0x08)
+			return true
+		case sdl.K_RIGHT:
+			sw.PressKey(0x15)
+			return true
+		case sdl.K_UP:
+			sw.PressKey(0x0B)
+			return true
+		case sdl.K_DOWN:
+			sw.PressKey(0x0A)
+			return true
+		}
+		return false
+	}
 	switch sym {
 	case sdl.K_LEFT:
 		leftHeld = true
@@ -533,7 +573,12 @@ func handleArrowKeyDown(sym sdl.Keycode, sw *appleio.SoftSwitches) bool {
 // handleArrowKeyUp maps arrow key releases to virtual paddle positions.
 // If the opposite direction key is still held, that direction is maintained;
 // otherwise the axis snaps back to center (128).
+// No-op under -paddle=off (Apple II keyboard has no release events — the
+// KEYDOWN path emits the cursor code and there is nothing to release).
 func handleArrowKeyUp(sym sdl.Keycode, sw *appleio.SoftSwitches) {
+	if !paddleArrows {
+		return
+	}
 	switch sym {
 	case sdl.K_LEFT:
 		leftHeld = false
