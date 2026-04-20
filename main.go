@@ -15,6 +15,7 @@ import (
 	"github.com/apple2emu/cpu"
 	"github.com/apple2emu/disk"
 	appleio "github.com/apple2emu/io"
+	"github.com/apple2emu/languageCard"
 	"github.com/apple2emu/memory"
 	"github.com/apple2emu/speaker"
 	"github.com/apple2emu/video"
@@ -84,6 +85,22 @@ func main() {
 	b.Map(0x0000, 0xBFFF, ram)
 	b.Map(0xC000, 0xC0FF, sw)
 	b.Map(rom.Base, rom.End(), rom)
+
+	// Language Card (slot 0) — 16 KB RAM overlaying $D000-$FFFF.
+	// Unconditional install: the three shipped ROMs (Apple2.rom,
+	// Apple2_Plus.rom at $D000 covering 12 KB; Apple2e.rom at $C000
+	// covering 16 KB) all fully cover $D000-$FFFF. If a future change
+	// ships a partial/minimal ROM that does not cover $D000-$FFFF,
+	// NewCard will hold a rom pointer whose Read returns 0xFF for
+	// uncovered offsets (see memory/rom.go) — that is a configuration
+	// bug in the loader, not a runtime concern here.
+	// Mapped AFTER io.SoftSwitches so its $C080-$C08F handler wins the
+	// address-decode race (bus last-mapping-wins).
+	lc := languageCard.NewCard(rom)
+	b.Map(0xD000, 0xFFFF, lc)
+	b.Map(0xC080, 0xC08F, languageCard.NewSwitches(lc))
+	// ROM remains mapped underneath but is never reached via bus
+	// fallthrough; the LC delegates to rom.Read when ramRead=false.
 
 	fmt.Printf("Apple II Emulator — Iteration 7\n")
 	fmt.Printf("ROM: %s (%d bytes at $%04X–$%04X)\n", *romPath, rom.Size(), rom.Base, rom.End())
@@ -269,6 +286,7 @@ func main() {
 					// Ctrl+R to reset (no audio interference: buffers drain naturally)
 					if e.Keysym.Sym == sdl.K_r && e.Keysym.Mod&sdl.KMOD_CTRL != 0 {
 						c.Reset()
+						lc.Reset()
 						break
 					}
 					// Ctrl+1 / Ctrl+2 eject the respective drive.
