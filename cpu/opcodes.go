@@ -509,6 +509,8 @@ func opBCS(c *CPU, mode addrMode) { c.branch(mode, c.getFlag(FlagC)) }
 func opBEQ(c *CPU, mode addrMode) { c.branch(mode, c.getFlag(FlagZ)) }
 func opBMI(c *CPU, mode addrMode) { c.branch(mode, c.getFlag(FlagN)) }
 func opBNE(c *CPU, mode addrMode) { c.branch(mode, !c.getFlag(FlagZ)) }
+
+// Branch if Flag N(negative) is positive(not set) -> When new key is pressed, N flag is set.
 func opBPL(c *CPU, mode addrMode) { c.branch(mode, !c.getFlag(FlagN)) }
 func opBVC(c *CPU, mode addrMode) { c.branch(mode, !c.getFlag(FlagV)) }
 func opBVS(c *CPU, mode addrMode) { c.branch(mode, c.getFlag(FlagV)) }
@@ -525,6 +527,7 @@ func opJSR(c *CPU, mode addrMode) {
 	c.PC = target
 }
 
+// ReTurn from Subroutine, pops a return address off the stack and load it into PC
 func opRTS(c *CPU, _ addrMode) {
 	c.PC = c.pull16() + 1
 }

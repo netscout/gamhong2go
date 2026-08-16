@@ -38,10 +38,10 @@ func (v *Video) Render(textMode, mixedMode, hiRes, page2 bool) {
 	v.flashCounter++
 	if v.flashCounter >= 16 {
 		v.flashCounter = 0
-		v.FlashState = !v.FlashState
+		v.FlashState = !v.FlashState // toggle every 16 frames
 	}
 
-	switch {
+	switch { // dispatch to chosen renderer
 	case textMode:
 		v.RenderText()
 	case hiRes:
@@ -60,13 +60,15 @@ func (v *Video) RenderText() {
 // renderTextRows renders a range of text rows [startRow, endRow).
 // Used by both full text mode and mixed-mode graphics.
 func (v *Video) renderTextRows(startRow, endRow int) {
-	for row := startRow; row < endRow; row++ {
-		baseAddr := textLineAddr(row)
+	for row := startRow; row < endRow; row++ { // for every 24 text rows
+		baseAddr := textLineAddr(row) // get memory addr of the text row
 
-		for col := 0; col < TextCols; col++ {
+		for col := 0; col < TextCols; col++ { // for every 40 columns
 			screenByte := v.RAM[baseAddr+uint16(col)]
 
+			// Each cell is 8 horizontal stripes (1px tall × 7px wide) stacked vertically.
 			for scanline := 0; scanline < CharH; scanline++ {
+				// pixels: bits 0–6 = the 7 pixel columns of this one stripe (bit 0 = leftmost).
 				pixels, inverse := CharGenROM(screenByte, scanline)
 
 				// Handle flashing: characters in $40–$7F range
@@ -74,10 +76,15 @@ func (v *Video) renderTextRows(startRow, endRow int) {
 					inverse = true
 				}
 
-				// Render 7 pixels for this scanline of this character
+				// Paint this stripe: 7 pixels (each = 4 RGBA bytes) into v.Pixels.
 				py := row*CharH + scanline
+				// 1. for px in 0..6
+				// 2. get the bit at position px and check if it's 0 or 1 → lit
+				// 3. if inverse, flip lit
+				// 4. compute the pixel's byte offset in v.Pixels from its row/column position
+				// 5. write 4 bytes at that offset: ColorOn if lit, else ColorOff
 				for px := 0; px < CharW; px++ {
-					// Bit 0 = leftmost pixel
+					// Bit 0 = leftmost pixel (the loop reads bit 0 first via pixels>>0).
 					lit := (pixels>>uint(px))&1 != 0
 					if inverse {
 						lit = !lit

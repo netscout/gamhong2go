@@ -26,8 +26,16 @@ go.work
 
 # End of https://www.toptal.com/developers/gitignore/api/go
 
-.claude
+# Agent working files
+.claude/
 
-games
+# Emulator assets — copyrighted, not redistributed here.
+# See README → "ROMs and disk images" for where to download them.
+roms/
+disks/
+games/
 
+# Build output
 apple2emu
+
+.DS_Store
