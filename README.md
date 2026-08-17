@@ -305,3 +305,8 @@ main.go       SDL2 window, event loop, flag parsing, wiring
 ```sh
 go test ./...
 ```
+
+## License
+
+[MIT](LICENSE). This covers the emulator's code only — ROMs, disk images, and games
+stay under their own owners' copyright, which is why the repo doesn't ship them.
