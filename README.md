@@ -1,7 +1,21 @@
-# apple2emu
+# gamhong2go
 
-An Apple II / II+ emulator written in Go. CPU, video, speaker, Disk II,
-and Language Card (16 KB RAM at $D000–$FFFF with $C080–$C08F bank switching).
+Yet another Apple II emulator, this one in Go.
+
+6502 CPU, video, speaker, Disk II, and a Language Card (16 KB RAM at `$D000–$FFFF`
+with `$C080–$C08F` bank switching) — enough to boot DOS 3.3 and play Karateka.
+
+### Why "gamhong2go"?
+
+It's "Apple II in Go", with the apple swapped for a Korean one.
+
+| Piece     | Meaning                                                                 |
+|-----------|-------------------------------------------------------------------------|
+| `gamhong` | 감홍 — a premium Korean apple cultivar. Very sweet, very crisp, and priced accordingly. |
+| `2`       | The `II` in Apple II.                                                   |
+| `go`      | The language it's written in.                                           |
+
+Say it quickly and it also comes out as "gamhong, to go."
 
 ## Prerequisites
 
