@@ -1,4 +1,4 @@
-module github.com/apple2emu
+module github.com/netscout/gamhong2go
 
 go 1.21
 

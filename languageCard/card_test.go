@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/apple2emu/bus"
+	"github.com/netscout/gamhong2go/bus"
 )
 
 // fakeROM is a stub ROMReader for tests. Returns a fixed sentinel byte

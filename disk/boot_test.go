@@ -5,10 +5,10 @@ import (
 	"os"
 	"testing"
 
-	"github.com/apple2emu/bus"
-	"github.com/apple2emu/cpu"
-	appleio "github.com/apple2emu/io"
-	"github.com/apple2emu/memory"
+	"github.com/netscout/gamhong2go/bus"
+	"github.com/netscout/gamhong2go/cpu"
+	appleio "github.com/netscout/gamhong2go/io"
+	"github.com/netscout/gamhong2go/memory"
 )
 
 // TestBootPROM_LoadsT0S0 is an integration test that wires up the real CPU,

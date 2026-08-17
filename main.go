@@ -11,14 +11,14 @@ import (
 
 	"github.com/veandco/go-sdl2/sdl"
 
-	"github.com/apple2emu/bus"
-	"github.com/apple2emu/cpu"
-	"github.com/apple2emu/disk"
-	appleio "github.com/apple2emu/io"
-	"github.com/apple2emu/languageCard"
-	"github.com/apple2emu/memory"
-	"github.com/apple2emu/speaker"
-	"github.com/apple2emu/video"
+	"github.com/netscout/gamhong2go/bus"
+	"github.com/netscout/gamhong2go/cpu"
+	"github.com/netscout/gamhong2go/disk"
+	appleio "github.com/netscout/gamhong2go/io"
+	"github.com/netscout/gamhong2go/languageCard"
+	"github.com/netscout/gamhong2go/memory"
+	"github.com/netscout/gamhong2go/speaker"
+	"github.com/netscout/gamhong2go/video"
 )
 
 const (

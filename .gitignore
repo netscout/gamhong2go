@@ -35,7 +35,7 @@ roms/
 disks/
 games/
 
-# Build output
-apple2emu
+# Build output (named after the module's last element)
+gamhong2go
 
 .DS_Store
